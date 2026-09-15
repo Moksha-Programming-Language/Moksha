@@ -454,6 +454,7 @@ static std::string unescapeString(llvm::StringRef raw) {
         break;
       }
       default:
+        result += '\\';
         result += escape;
         i++;
         break;
@@ -1021,8 +1022,11 @@ std::vector<DeclPtr> Parser::parseTopLevelDecls() {
       ret.push_back(std::move(d));
     return ret;
   }
-  if (curTok.isAny(TokenKind::KwClass, TokenKind::KwStruct, TokenKind::KwRef,
-                   TokenKind::KwUnion)) {
+  if (curTok.isAny(TokenKind::KwClass, TokenKind::KwStruct,
+                   TokenKind::KwUnion) ||
+      (curTok.is(TokenKind::KwRef) &&
+       nextTok.isAny(TokenKind::KwClass, TokenKind::KwStruct,
+                     TokenKind::KwUnion))) {
     std::vector<DeclPtr> ret;
     auto decl = parseClassDecl();
     if (auto cls = llvm::dyn_cast_or_null<ClassDecl>(decl.get())) {
@@ -1085,10 +1089,10 @@ std::vector<DeclPtr> Parser::parseTopLevelDecls() {
       if (clonedType->is<PointerType>() || clonedType->is<ReferenceType>() ||
           clonedType->is<NamedType>()) {
         isARCWeak = true;
+        SourceLocation weakLoc = clonedType->getLoc();
         clonedType = std::make_unique<NullableType>(
-            std::make_unique<WeakType>(std::move(clonedType),
-                                       clonedType->getLoc()),
-            clonedType->getLoc());
+            std::make_unique<WeakType>(std::move(clonedType), weakLoc),
+            weakLoc);
       }
     }
 
@@ -1515,10 +1519,10 @@ DeclPtr Parser::parseGenericDecl() {
                                             isAsync, isStatic, isWeak, memVis));
       } else {
         if (isWeak) {
+          SourceLocation weakLoc = memberType->getLoc();
           memberType = std::make_unique<NullableType>(
-              std::make_unique<WeakType>(std::move(memberType),
-                                         memberType->getLoc()),
-              memberType->getLoc());
+              std::make_unique<WeakType>(std::move(memberType), weakLoc),
+              weakLoc);
         }
         auto varDecl =
             parseVariableRest(std::move(memberType), memName, isConstVar,
@@ -1782,10 +1786,10 @@ DeclPtr Parser::parseClassDecl() {
       TypePtr baseType = memberType->clone();
 
       if (isWeak) {
+        SourceLocation weakLoc = memberType->getLoc();
         memberType = std::make_unique<NullableType>(
-            std::make_unique<WeakType>(std::move(memberType),
-                                       memberType->getLoc()),
-            memberType->getLoc());
+            std::make_unique<WeakType>(std::move(memberType), weakLoc),
+            weakLoc);
       }
       auto varDecl = parseVariableRest(std::move(memberType), memName,
                                        isConstVar, isStatic, isShared, memVis);
@@ -1803,10 +1807,10 @@ DeclPtr Parser::parseClassDecl() {
 
         TypePtr nextType = baseType->clone();
         if (isWeak) {
+          SourceLocation weakLoc = nextType->getLoc();
           nextType = std::make_unique<NullableType>(
-              std::make_unique<WeakType>(std::move(nextType),
-                                         nextType->getLoc()),
-              nextType->getLoc());
+              std::make_unique<WeakType>(std::move(nextType), weakLoc),
+              weakLoc);
         }
 
         auto nextVarDecl =

@@ -1,6 +1,6 @@
-println("--- [E2E] cross_module_generics_import.mox ---")
-
 from "cross_module_generics_export" import { Box }
+
+println("--- [E2E] cross_module_generics_import.mox ---")
 
 // The TypeChecker must be able to resolve `T` as `int`, verify the constructor,
 // and compute memory layout for a class defined in a completely different AST module.

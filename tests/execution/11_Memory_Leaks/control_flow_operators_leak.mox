@@ -1,0 +1,65 @@
+// For future implementation
+
+ref class UserSession {
+    public string username;
+    public string[]? roles;
+
+    constructor(string username, string[]? roles) {
+        this.username = username;
+        this.roles = roles;
+    }
+}
+
+string[] get_default_roles() {
+    return ["guest", "unverified"];
+}
+
+string get_fallback_string(int choice) {
+    return choice > 0 ? "fallback_positive" : "fallback_negative";
+}
+
+void test_null_coalescing_leak() {
+    int? maybe_count = null;
+    int count = maybe_count ?? 100;
+
+    string? opt_str = null;
+    string final_str = opt_str ?? ("temporary_" + "created_" + "string");
+
+    string[]? opt_roles = null;
+    string[] active_roles = opt_roles ?? get_default_roles();
+
+    string? s1 = null;
+    string? s2 = null;
+    string s3 = s1 ?? (s2 ?? "terminal_fallback");
+}
+
+/* void test_ternary_operator_leak() {
+    bool flag = true;
+    string chosen_str = flag ? ("true_branch_" + "payload") : ("false_branch_" + "payload");
+
+    int[] chosen_arr = (!flag) ? [1, 2, 3] : [4, 5, 6, 7];
+
+    int mode = 2;
+    string nested_decision = (mode == 1)
+        ? "mode_1"
+        : ((mode == 2) ? get_fallback_string(1) : get_fallback_string(-1));
+} */
+
+void test_nested_operator_boundaries() {
+    shared UserSession? session = cast<UserSession?>(new UserSession("root_user", null));
+
+    string[] assigned_roles = (session != null ? session?.roles : null) ?? ["default_user"];
+
+    session?.roles = ["admin", "superadmin"];
+
+    string[] current_roles = session?.roles ?? get_default_roles();
+
+    session = null;
+}
+
+println("--- [E2E] control_flow_operators_leak.mox ---");
+while (true) {
+    test_null_coalescing_leak();
+    // test_ternary_operator_leak();
+    test_nested_operator_boundaries();
+}

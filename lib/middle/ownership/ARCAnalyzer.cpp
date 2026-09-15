@@ -140,24 +140,45 @@ private:
     MIRValue *directObj = retain->getObject();
 
     if (directObj && directObj->getType()) {
-      std::string tyStr = directObj->getType()->toString();
-      std::string className = "";
+      std::string className = directObj->getType()->toString();
 
-      size_t qPos = tyStr.find('?');
+      auto removePrefix = [&](const std::string &prefix) {
+        if (className.find(prefix) == 0)
+          className = className.substr(prefix.length());
+      };
+
+      while (!className.empty() &&
+             (className[0] == '&' || className[0] == '*' ||
+              className[0] == ' ' || className[0] == '?')) {
+        className = className.substr(1);
+      }
+
+      size_t qPos = className.find('?');
       if (qPos != std::string::npos) {
-        tyStr = tyStr.substr(0, qPos);
+        className = className.substr(0, qPos);
       }
 
-      if (!tyStr.empty() && tyStr[0] == '*') {
-        className = tyStr.substr(1);
-      } else if (tyStr.find("shared ") == 0) {
-        className = tyStr.substr(7);
-      }
+      removePrefix("shared ");
+      removePrefix("owned ");
+      removePrefix("weak ");
+      removePrefix("mut ");
+      removePrefix("view ");
+      removePrefix("lock ");
+      removePrefix("struct ");
+      removePrefix("class ");
 
-      if (className.find("struct ") == 0)
-        className = className.substr(7);
-      if (className.find("class ") == 0)
-        className = className.substr(6);
+      size_t arcPos = className.find("Arc<");
+      size_t boxPos = className.find("Box<");
+      size_t startPos =
+          (arcPos != std::string::npos)
+              ? arcPos
+              : ((boxPos != std::string::npos) ? boxPos : std::string::npos);
+      if (startPos != std::string::npos) {
+        className = className.substr(startPos + 4);
+        size_t endPos = className.rfind(">");
+        if (endPos != std::string::npos)
+          className = className.substr(0, endPos);
+      }
 
       if (!className.empty()) {
         std::string dropPrefix = className + ".destructor";
@@ -211,6 +232,11 @@ private:
         }
       } else if (auto *store = llvm::dyn_cast_or_null<StoreInst>(inst)) {
         if (getUnderlyingObject(store->getValue()) == targetVal) {
+          if (!llvm::isa<AllocaInst>(store->getPointer())) {
+            return false;
+          }
+        }
+        if (getUnderlyingObject(store->getPointer()) == targetVal) {
           return false;
         }
       } else if (auto *storeW = llvm::dyn_cast_or_null<StoreWeakInst>(inst)) {

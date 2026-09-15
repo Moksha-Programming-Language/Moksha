@@ -1,0 +1,37 @@
+println("--- [E2E] unsafe_union_stress.mox ---");
+
+union VariantPayload {
+    int raw_bits;
+    string managed_str;
+    string[] managed_arr;
+}
+
+void test_union_str_leak() {
+    unsafe {
+        VariantPayload u;
+        u.managed_str = "ephemeral_union_string";
+    }
+}
+
+void test_union_arr_leak() {
+    unsafe {
+        VariantPayload u;
+        u.managed_arr = ["union_item_1", "union_item_2"];
+    }
+}
+
+void test_union_corruption_leak() {
+    unsafe {
+        VariantPayload u;
+        u.managed_str = "string_to_be_corrupted";
+
+        // Overwriting the active pointer with raw bits
+        u.raw_bits = 0;
+    }
+}
+
+while (true) {
+    test_union_str_leak();
+    test_union_arr_leak();
+    test_union_corruption_leak();
+}

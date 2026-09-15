@@ -31,4 +31,4 @@ void test_pipeline_eval() {
 }
 
 test_pipeline_eval();
-test_async_finally()
+await test_async_finally()

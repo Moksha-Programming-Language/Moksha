@@ -9,6 +9,9 @@ extern void moksha_rt_panic(const char *message);
 extern void moksha_rt_retain(void *ptr);
 extern void moksha_rt_release(void *ptr);
 extern void moksha_mem_free(void *ptr);
+extern void moksha_rt_release_with_dtor(void *ptr, void (*dtor)(void *));
+
+// Map Structure
 
 #define MAP_INITIAL_CAPACITY 16
 
@@ -17,6 +20,7 @@ typedef struct MapEntry {
   MokshaAny value;
   struct MapEntry *next;
   struct MapEntry *order_next;
+  struct MapEntry *order_prev;
 } MapEntry;
 
 typedef struct {
@@ -25,36 +29,47 @@ typedef struct {
   uint32_t size;
   MapEntry *head;
   MapEntry *tail;
+  uint32_t iter_cache_idx;
+  MapEntry *iter_cache_node;
 } MokshaMap;
 
-/** @brief Internal Helper: Unwrap compiler-boxed IndexExpr pointers */
+// Internal map utilities
 
-// Bare-metal string comparison
 static int internal_strcmp(const char *s1, const char *s2) {
-  while (*s1 && (*s1 == *s2)) {
-    s1++;
-    s2++;
-  }
-  return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+  return __builtin_strcmp(s1, s2);
 }
 
-// Safely extract type_id even if vtable is NULL
 static uint32_t get_any_type(MokshaAny *key) {
   if (!key || !key->data)
     return 0;
-
   if (key->vtable)
     return key->vtable->type_id;
-
   MokshaHeader *hdr =
       (MokshaHeader *)((uint8_t *)key->data - sizeof(MokshaHeader));
   return hdr->type_id;
 }
 
+static void consume_any_into(MokshaAny *dest, MokshaAny *src) {
+  dest->vtable = src->vtable;
+  uint32_t type = get_any_type(src);
+
+  if (type == MOKSHA_TYPE_I32 || type == MOKSHA_TYPE_U32 ||
+      type == MOKSHA_TYPE_F32 || type == MOKSHA_TYPE_BOOL) {
+    dest->data = moksha_rt_alloc(4, type);
+    *(uint32_t *)dest->data = *(uint32_t *)src->data;
+  } else if (type == MOKSHA_TYPE_I64 || type == MOKSHA_TYPE_U64 ||
+             type == MOKSHA_TYPE_ISIZE || type == MOKSHA_TYPE_USIZE ||
+             type == MOKSHA_TYPE_F64) {
+    dest->data = moksha_rt_alloc(8, type);
+    *(uint64_t *)dest->data = *(uint64_t *)src->data;
+  } else {
+    dest->data = src->data;
+  }
+}
+
 static uint32_t hash_any(MokshaAny *key) {
   if (!key || !key->data)
     return 0;
-
   uint32_t type_id = get_any_type(key);
   uint32_t hash = 2166136261u;
 
@@ -67,7 +82,6 @@ static uint32_t hash_any(MokshaAny *key) {
     }
     return hash;
   }
-
   if (type_id == MOKSHA_TYPE_I32 || type_id == MOKSHA_TYPE_U32 ||
       type_id == MOKSHA_TYPE_F32) {
     uint32_t val = *(uint32_t *)key->data;
@@ -75,7 +89,6 @@ static uint32_t hash_any(MokshaAny *key) {
     hash *= 16777619;
     return hash;
   }
-
   if (type_id == MOKSHA_TYPE_I64 || type_id == MOKSHA_TYPE_U64 ||
       type_id == MOKSHA_TYPE_ISIZE || type_id == MOKSHA_TYPE_USIZE ||
       type_id == MOKSHA_TYPE_F64) {
@@ -86,8 +99,6 @@ static uint32_t hash_any(MokshaAny *key) {
     hash *= 16777619;
     return hash;
   }
-
-  // Fallback: Pointer Hashing for Objects
   uint64_t addr = (uint64_t)(uintptr_t)key->data;
   hash ^= (uint32_t)(addr & 0xFFFFFFFF);
   hash *= 16777619;
@@ -100,37 +111,30 @@ static bool cmp_any(MokshaAny *a, MokshaAny *b) {
   if (!a || !b)
     return false;
   if (a->data == b->data)
-    return true; // Fast path for identical pointers
+    return true;
   if (!a->data || !b->data)
     return false;
 
   uint32_t type_a = get_any_type(a);
   uint32_t type_b = get_any_type(b);
-
   if (type_a != type_b)
     return false;
 
   if (type_a == MOKSHA_TYPE_STRING) {
-    const char *str_a = (const char *)a->data;
-    const char *str_b = (const char *)b->data;
-    return internal_strcmp(str_a, str_b) == 0;
+    return internal_strcmp((const char *)a->data, (const char *)b->data) == 0;
   }
-
   if (type_a == MOKSHA_TYPE_I32 || type_a == MOKSHA_TYPE_U32 ||
       type_a == MOKSHA_TYPE_F32) {
     return *(uint32_t *)a->data == *(uint32_t *)b->data;
   }
-
   if (type_a == MOKSHA_TYPE_I64 || type_a == MOKSHA_TYPE_U64 ||
       type_a == MOKSHA_TYPE_ISIZE || type_a == MOKSHA_TYPE_USIZE ||
       type_a == MOKSHA_TYPE_F64) {
     return *(uint64_t *)a->data == *(uint64_t *)b->data;
   }
-
   return false;
 }
 
-// Forward to our unified logic
 static bool map_keys_equal(MokshaAny *k1, MokshaAny *k2) {
   return cmp_any(k1, k2);
 }
@@ -145,12 +149,11 @@ void *moksha_rt_map_new(void) {
   map->size = 0;
   map->head = NULL;
   map->tail = NULL;
+  map->iter_cache_node = NULL;
   map->buckets =
       (MapEntry **)moksha_mem_alloc(sizeof(MapEntry *) * MAP_INITIAL_CAPACITY);
 
-  for (uint32_t i = 0; i < MAP_INITIAL_CAPACITY; i++) {
-    map->buckets[i] = NULL;
-  }
+  __builtin_memset(map->buckets, 0, sizeof(MapEntry *) * MAP_INITIAL_CAPACITY);
   return map;
 }
 
@@ -159,28 +162,29 @@ void moksha_rt_map_insert(void *map_ptr, MokshaAny *key, MokshaAny *value) {
     return;
   MokshaMap *map = (MokshaMap *)map_ptr;
 
-  uint32_t hash = hash_any(key);
-  uint32_t index = hash % map->capacity;
-
+  uint32_t index = hash_any(key) % map->capacity;
   MapEntry *entry = map->buckets[index];
+
   while (entry) {
     if (cmp_any(&entry->key, key)) {
-      moksha_rt_release(entry->value.data);
-      moksha_rt_retain(value->data);
-      entry->value = *value;
+      void (*val_drop)(void *) =
+          entry->value.vtable ? entry->value.vtable->drop : NULL;
+      moksha_rt_release_with_dtor(entry->value.data, val_drop);
+      consume_any_into(&entry->value, value);
+      void (*key_drop)(void *) = key->vtable ? key->vtable->drop : NULL;
+      moksha_rt_release_with_dtor(key->data, key_drop);
       return;
     }
     entry = entry->next;
   }
 
-  moksha_rt_retain(key->data);
-  moksha_rt_retain(value->data);
-
   MapEntry *new_entry = (MapEntry *)moksha_mem_alloc(sizeof(MapEntry));
-  new_entry->key = *key;
-  new_entry->value = *value;
+  consume_any_into(&new_entry->key, key);
+  consume_any_into(&new_entry->value, value);
+
   new_entry->next = map->buckets[index];
   new_entry->order_next = NULL;
+  new_entry->order_prev = map->tail;
 
   map->buckets[index] = new_entry;
   map->size++;
@@ -195,10 +199,8 @@ void moksha_rt_map_insert(void *map_ptr, MokshaAny *key, MokshaAny *value) {
 MokshaAny *moksha_rt_map_get(void *map_ptr, MokshaAny *key) {
   if (!map_ptr || !key || !key->data)
     return NULL;
-
   MokshaMap *map = (MokshaMap *)map_ptr;
-  uint32_t hash = hash_any(key);
-  uint32_t index = hash % map->capacity;
+  uint32_t index = hash_any(key) % map->capacity;
 
   MapEntry *entry = map->buckets[index];
   while (entry) {
@@ -209,57 +211,30 @@ MokshaAny *moksha_rt_map_get(void *map_ptr, MokshaAny *key) {
   return NULL;
 }
 
-/** @brief Dynamic 'Any' Indexing Dispatcher */
-
-MokshaAny *moksha_rt_any_get(MokshaAny *container, MokshaAny *key) {
-  if (!container || !key || !container->data)
+static MapEntry *get_entry_at(MokshaMap *map, int32_t index) {
+  if (index < 0 || (uint32_t)index >= map->size)
     return NULL;
 
-  uint32_t type_id = get_any_type(container);
-
-  // 1. Route Map Lookups (e.g., row["name"])
-  if (type_id == MOKSHA_TYPE_TABLE) {
-    return moksha_rt_map_get(container->data, key);
-  }
-  // 2. Route Array/Slice Lookups (e.g., data_in[0])
-  else if (type_id == MOKSHA_TYPE_ARRAY) {
-    uint32_t key_type = get_any_type(key);
-    int64_t index = 0;
-
-    // Safely extract the index regardless of integer size
-    if (key_type == MOKSHA_TYPE_I32 || key_type == MOKSHA_TYPE_U32) {
-      index = *(int32_t *)key->data;
-    } else if (key_type == MOKSHA_TYPE_I64 || key_type == MOKSHA_TYPE_U64 ||
-               key_type == MOKSHA_TYPE_ISIZE || key_type == MOKSHA_TYPE_USIZE) {
-      index = *(int64_t *)key->data;
-    } else {
-      moksha_rt_panic("Type Error: Array index must be an integer.");
+  if (map->iter_cache_node) {
+    if ((uint32_t)index == map->iter_cache_idx + 1 &&
+        map->iter_cache_node->order_next) {
+      map->iter_cache_idx++;
+      map->iter_cache_node = map->iter_cache_node->order_next;
+      return map->iter_cache_node;
     }
-
-    MokshaSlice *slice = (MokshaSlice *)container->data;
-
-    // Bounds checking
-    if (index < 0 || (uint64_t)index >= slice->length) {
-      moksha_rt_panic_out_of_bounds(index, slice->length);
+    if ((uint32_t)index == map->iter_cache_idx) {
+      return map->iter_cache_node;
     }
-
-    // Because the container is an 'any', its elements are boxed as 'MokshaAny'
-    // structs
-    MokshaAny *arr = (MokshaAny *)slice->data;
-    return &arr[index];
   }
 
-  // 3. Fallback for invalid types
-  moksha_rt_panic("Type Error: Cannot index into a non-collection 'any' type.");
-  return NULL;
-}
-
-static MapEntry *get_entry_at(MokshaMap *map, int32_t index) {
   int32_t count = 0;
   MapEntry *curr = map->head;
   while (curr) {
-    if (count == index)
+    if (count == index) {
+      map->iter_cache_idx = index;
+      map->iter_cache_node = curr;
       return curr;
+    }
     count++;
     curr = curr->order_next;
   }
@@ -267,17 +242,18 @@ static MapEntry *get_entry_at(MokshaMap *map, int32_t index) {
 }
 
 MokshaAny *moksha_rt_map_get_key_at(void *map_ptr, int32_t index) {
-  if (!map_ptr)
-    return NULL;
   MapEntry *entry = get_entry_at((MokshaMap *)map_ptr, index);
   return entry ? &entry->key : NULL;
 }
 
 MokshaAny *moksha_rt_map_get_val_at(void *map_ptr, int32_t index) {
-  if (!map_ptr)
-    return NULL;
   MapEntry *entry = get_entry_at((MokshaMap *)map_ptr, index);
   return entry ? &entry->value : NULL;
+}
+
+void *moksha_rt_map_get_val_ptr_at(void *map_ptr, int32_t index) {
+  MapEntry *entry = get_entry_at((MokshaMap *)map_ptr, index);
+  return entry ? entry->value.data : NULL;
 }
 
 void moksha_rt_map_free_internal(void *map_ptr) {
@@ -289,46 +265,37 @@ void moksha_rt_map_free_internal(void *map_ptr) {
     MapEntry *entry = map->buckets[i];
     while (entry) {
       MapEntry *next = entry->next;
+      void (*key_drop)(void *) =
+          entry->key.vtable ? entry->key.vtable->drop : NULL;
+      moksha_rt_release_with_dtor(entry->key.data, key_drop);
 
-      // Release the keys and values so they can drop to 0 safely
-      moksha_rt_release(entry->key.data);
-      moksha_rt_release(entry->value.data);
+      void (*val_drop)(void *) =
+          entry->value.vtable ? entry->value.vtable->drop : NULL;
+      moksha_rt_release_with_dtor(entry->value.data, val_drop);
 
-      // Free the linked list node itself
       moksha_mem_free(entry);
       entry = next;
     }
   }
-
-  // Free the bucket array
-  if (map->buckets) {
+  if (map->buckets)
     moksha_mem_free(map->buckets);
-  }
 }
 
 int32_t moksha_rt_map_len(void *map_ptr) {
   if (!map_ptr)
     return 0;
-
-  MokshaMap *map = (MokshaMap *)map_ptr;
-  return (int32_t)map->size;
+  return (int32_t)((MokshaMap *)map_ptr)->size;
 }
 
-/** @brief Moksha Map Builtins */
-
-extern MokshaAny *moksha_rt_map_get(void *map_ptr, MokshaAny *key);
-
 bool moksha_rt_map_has(void *map_ptr, MokshaAny *key) {
-  if (!map_ptr || !key)
-    return false;
   return moksha_rt_map_get(map_ptr, key) != NULL;
 }
 
 int32_t moksha_rt_map_length(void *map_ptr) {
-  if (!map_ptr)
-    return 0;
-  return ((MokshaMap *)map_ptr)->size;
+  return moksha_rt_map_len(map_ptr);
 }
+
+// Implementation of Map runtime builtins
 
 void moksha_rt_map_clear(void *map_ptr) {
   if (!map_ptr)
@@ -337,15 +304,21 @@ void moksha_rt_map_clear(void *map_ptr) {
   MapEntry *curr = map->head;
   while (curr) {
     MapEntry *next = curr->order_next;
+    void (*key_drop)(void *) = curr->key.vtable ? curr->key.vtable->drop : NULL;
+    moksha_rt_release_with_dtor(curr->key.data, key_drop);
+
+    void (*val_drop)(void *) =
+        curr->value.vtable ? curr->value.vtable->drop : NULL;
+    moksha_rt_release_with_dtor(curr->value.data, val_drop);
+
     moksha_mem_free(curr);
     curr = next;
   }
-  for (uint32_t i = 0; i < map->capacity; i++) {
-    map->buckets[i] = NULL;
-  }
+  __builtin_memset(map->buckets, 0, sizeof(MapEntry *) * map->capacity);
   map->head = NULL;
   map->tail = NULL;
   map->size = 0;
+  map->iter_cache_node = NULL;
 }
 
 void moksha_rt_map_remove(void *map_ptr, MokshaAny *key) {
@@ -353,40 +326,114 @@ void moksha_rt_map_remove(void *map_ptr, MokshaAny *key) {
     return;
   MokshaMap *map = (MokshaMap *)map_ptr;
 
-  MapEntry *curr = map->head;
-  MapEntry *prev = NULL;
-  while (curr) {
-    if (map_keys_equal(&curr->key, key)) {
-      // 1. Unlink from insertion-ordered list
-      if (prev)
-        prev->order_next = curr->order_next;
+  uint32_t index = hash_any(key) % map->capacity;
+  MapEntry *b_curr = map->buckets[index];
+  MapEntry *b_prev = NULL;
+  MapEntry *target = NULL;
+
+  while (b_curr) {
+    if (map_keys_equal(&b_curr->key, key)) {
+      target = b_curr;
+      if (b_prev)
+        b_prev->next = b_curr->next;
       else
-        map->head = curr->order_next;
-      if (map->tail == curr)
-        map->tail = prev;
-
-      // 2. Unlink from hash buckets
-      for (uint32_t i = 0; i < map->capacity; i++) {
-        MapEntry *b_curr = map->buckets[i];
-        MapEntry *b_prev = NULL;
-        while (b_curr) {
-          if (b_curr == curr) {
-            if (b_prev)
-              b_prev->next = b_curr->next;
-            else
-              map->buckets[i] = b_curr->next;
-            break;
-          }
-          b_prev = b_curr;
-          b_curr = b_curr->next;
-        }
-      }
-
-      map->size--;
-      moksha_mem_free(curr);
-      return;
+        map->buckets[index] = b_curr->next;
+      break;
     }
-    prev = curr;
-    curr = curr->order_next;
+    b_prev = b_curr;
+    b_curr = b_curr->next;
   }
+
+  if (!target)
+    return;
+
+  if (target->order_prev)
+    target->order_prev->order_next = target->order_next;
+  else
+    map->head = target->order_next;
+
+  if (target->order_next)
+    target->order_next->order_prev = target->order_prev;
+  else
+    map->tail = target->order_prev;
+
+  map->iter_cache_node = NULL;
+  void (*key_drop)(void *) =
+      target->key.vtable ? target->key.vtable->drop : NULL;
+  moksha_rt_release_with_dtor(target->key.data, key_drop);
+
+  void (*val_drop)(void *) =
+      target->value.vtable ? target->value.vtable->drop : NULL;
+  moksha_rt_release_with_dtor(target->value.data, val_drop);
+
+  map->size--;
+  moksha_mem_free(target);
+}
+
+void *moksha_rt_map_get_or_create(void *map_ptr, MokshaAny *key,
+                                  size_t val_size, uint32_t val_type_id) {
+  if (!map_ptr || !key || !key->data)
+    return NULL;
+  MokshaMap *map = (MokshaMap *)map_ptr;
+  uint32_t index = hash_any(key) % map->capacity;
+
+  MapEntry *entry = map->buckets[index];
+  while (entry) {
+    if (cmp_any(&entry->key, key)) {
+      void (*key_drop)(void *) = key->vtable ? key->vtable->drop : NULL;
+      moksha_rt_release_with_dtor(key->data, key_drop);
+      return entry->value.data;
+    }
+    entry = entry->next;
+  }
+
+  void *val_payload = moksha_rt_alloc(val_size, val_type_id);
+
+  MapEntry *new_entry = (MapEntry *)moksha_mem_alloc(sizeof(MapEntry));
+  consume_any_into(&new_entry->key, key);
+  new_entry->value.data = val_payload;
+  new_entry->value.vtable = NULL;
+  new_entry->next = map->buckets[index];
+  new_entry->order_next = NULL;
+  new_entry->order_prev = map->tail;
+
+  map->buckets[index] = new_entry;
+  map->size++;
+
+  if (map->tail)
+    map->tail->order_next = new_entry;
+  else
+    map->head = new_entry;
+  map->tail = new_entry;
+
+  return val_payload;
+}
+
+MokshaAny *moksha_rt_any_get(MokshaAny *container, MokshaAny *key) {
+  if (!container || !key || !container->data)
+    return NULL;
+  uint32_t type_id = get_any_type(container);
+
+  if (type_id == MOKSHA_TYPE_TABLE) {
+    return moksha_rt_map_get(container->data, key);
+  } else if (type_id == MOKSHA_TYPE_ARRAY) {
+    uint32_t key_type = get_any_type(key);
+    int64_t index = 0;
+    if (key_type == MOKSHA_TYPE_I32 || key_type == MOKSHA_TYPE_U32) {
+      index = *(int32_t *)key->data;
+    } else if (key_type == MOKSHA_TYPE_I64 || key_type == MOKSHA_TYPE_U64 ||
+               key_type == MOKSHA_TYPE_ISIZE || key_type == MOKSHA_TYPE_USIZE) {
+      index = *(int64_t *)key->data;
+    } else {
+      moksha_rt_panic("Type Error: Array index must be an integer.");
+    }
+    MokshaSlice *slice = (MokshaSlice *)container->data;
+    if (index < 0 || (uint64_t)index >= slice->length) {
+      moksha_rt_panic("Array out of bounds");
+    }
+    MokshaAny *arr = (MokshaAny *)slice->data;
+    return &arr[index];
+  }
+  moksha_rt_panic("Type Error: Cannot index into a non-collection 'any' type.");
+  return NULL;
 }

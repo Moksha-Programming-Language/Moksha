@@ -24,6 +24,14 @@ class MokshaToLLVMTypeConverter : public mlir::LLVMTypeConverter {
 public:
   MokshaToLLVMTypeConverter(mlir::MLIRContext *ctx)
       : mlir::LLVMTypeConverter(ctx) {
+
+    // Explicitly legalize already-valid types to prevent infinite recursion
+    addConversion([](mlir::Type type) -> std::optional<mlir::Type> {
+      if (type.getDialect().getNamespace() == "llvm")
+        return type;
+      return std::nullopt;
+    });
+
     // Hardware Promote f8 to f16 for native LLVM support
     addConversion([&](mlir::Float8E5M2Type type) {
       return mlir::Float16Type::get(type.getContext());
@@ -31,6 +39,7 @@ public:
     addConversion([&](mlir::Float8E4M3FNType type) {
       return mlir::Float16Type::get(type.getContext());
     });
+
     // Core Pointers and Arrays
     addConversion([&](IR::PointerType type) {
       return mlir::LLVM::LLVMPointerType::get(type.getContext());
@@ -40,7 +49,7 @@ public:
                                             type.getSize());
     });
     addConversion([&](IR::PromiseType type) -> mlir::Type {
-      return mlir::LLVM::LLVMPointerType::get(ctx);
+      return mlir::LLVM::LLVMPointerType::get(type.getContext());
     });
     addConversion([&](IR::SliceType type) {
       return mlir::LLVM::LLVMPointerType::get(type.getContext());
@@ -67,9 +76,6 @@ public:
     });
 
     // Opaque Handles (Mapped to ptr)
-    addConversion([&](IR::PromiseType type) {
-      return mlir::LLVM::LLVMPointerType::get(type.getContext());
-    });
     addConversion([&](IR::ThreadType type) {
       return mlir::LLVM::LLVMPointerType::get(type.getContext());
     });
@@ -88,22 +94,26 @@ public:
     addConversion([&](IR::MapType type) {
       return mlir::LLVM::LLVMPointerType::get(type.getContext());
     });
+
+    // Struct / Array Recursive Inner Flattening
     addConversion([this](mlir::LLVM::LLVMStructType type) -> mlir::Type {
       if (type.isOpaque())
         return type;
+
       llvm::SmallVector<mlir::Type, 4> newBody;
-      bool changed = false;
+      bool needsConversion = false;
 
       for (auto elemTy : type.getBody()) {
         mlir::Type converted = this->convertType(elemTy);
+        if (!converted)
+          return nullptr;
         if (converted != elemTy)
-          changed = true;
+          needsConversion = true;
         newBody.push_back(converted);
       }
 
-      if (!changed)
+      if (!needsConversion)
         return type;
-
       return mlir::LLVM::LLVMStructType::getLiteral(type.getContext(), newBody,
                                                     type.isPacked());
     });
@@ -111,6 +121,8 @@ public:
     addConversion([this](mlir::LLVM::LLVMArrayType type) -> mlir::Type {
       mlir::Type elemTy = type.getElementType();
       mlir::Type converted = this->convertType(elemTy);
+      if (!converted)
+        return nullptr;
       if (converted == elemTy)
         return type;
       return mlir::LLVM::LLVMArrayType::get(converted, type.getNumElements());
@@ -213,15 +225,10 @@ static uint32_t getMokshaTypeID(mlir::Type type) {
       return 16;
   }
 
-  std::string typeStr;
-  llvm::raw_string_ostream os(typeStr);
-  type.print(os);
-
-  if (typeStr.find("slice") != std::string::npos ||
-      typeStr.find("array") != std::string::npos) {
+  if (mlir::isa<IR::SliceType>(type) || mlir::isa<IR::ArrayType>(type)) {
     return 18;
   }
-  if (typeStr.find("table") != std::string::npos) {
+  if (mlir::isa<IR::MapType>(type)) {
     return 17;
   }
 
@@ -353,6 +360,18 @@ getOrCreateAnyVTable(mlir::ConversionPatternRewriter &rewriter,
   if (requiresDeref)
     vtableName += "_ptr";
 
+  if (auto stTy =
+          mlir::dyn_cast<mlir::LLVM::LLVMStructType>(llvmUnderlyingTy)) {
+    if (stTy.isIdentified()) {
+      std::string stName = stTy.getName().str();
+      for (char &c : stName) {
+        if (!isalnum(c))
+          c = '_';
+      }
+      vtableName += "_" + stName;
+    }
+  }
+
   auto globalOp = module.lookupSymbol<mlir::LLVM::GlobalOp>(vtableName);
   if (!globalOp) {
     mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -360,18 +379,25 @@ getOrCreateAnyVTable(mlir::ConversionPatternRewriter &rewriter,
     auto vtableTy = mlir::LLVM::LLVMStructType::getLiteral(
         rewriter.getContext(), {i32Ty, llvmPtrTy, llvmPtrTy, llvmPtrTy});
     std::string baseToStrName;
-    std::string extStr;
-    llvm::raw_string_ostream extOs(extStr);
-    origMokshaTy.print(extOs);
-
-    if (extStr.find("table") != std::string::npos) {
+    if (mlir::isa<IR::MapType>(origMokshaTy)) {
       baseToStrName =
           "__moksha_map_to_string_" + getMangledHIRTypeName(origMokshaTy);
-    } else if (extStr.find("slice") != std::string::npos ||
-               extStr.find("array") != std::string::npos) {
+    } else if (mlir::isa<IR::ArrayType>(origMokshaTy) ||
+               mlir::isa<IR::SliceType>(origMokshaTy)) {
       baseToStrName =
           "__moksha_array_to_string_" + getMangledHIRTypeName(origMokshaTy);
-    } else {
+    } else if (auto ptrTy = mlir::dyn_cast<IR::PointerType>(origMokshaTy)) {
+      if (mlir::isa<IR::MapType>(ptrTy.getPointee())) {
+        baseToStrName = "__moksha_map_to_string_" +
+                        getMangledHIRTypeName(ptrTy.getPointee());
+      } else if (mlir::isa<IR::ArrayType>(ptrTy.getPointee()) ||
+                 mlir::isa<IR::SliceType>(ptrTy.getPointee())) {
+        baseToStrName = "__moksha_array_to_string_" +
+                        getMangledHIRTypeName(ptrTy.getPointee());
+      }
+    }
+
+    if (baseToStrName.empty()) {
       switch (typeId) {
       case 0:
         baseToStrName = "__moksha_bool_to_string";
@@ -489,6 +515,41 @@ getOrCreateAnyVTable(mlir::ConversionPatternRewriter &rewriter,
         rewriter.create<mlir::LLVM::AddressOfOp>(loc, llvmPtrTy, toStrRef);
     mlir::Value retainFn = rewriter.create<mlir::LLVM::ZeroOp>(loc, llvmPtrTy);
     mlir::Value dropFn = rewriter.create<mlir::LLVM::ZeroOp>(loc, llvmPtrTy);
+
+    // DYNAMIC DESTRUCTOR RESOLUTION FOR 'ANY' TYPES
+    std::string dropName = "";
+    if (auto stTy =
+            mlir::dyn_cast<mlir::LLVM::LLVMStructType>(llvmUnderlyingTy)) {
+      if (stTy.isIdentified()) {
+        std::string name = stTy.getName().str();
+        if (name.find("struct.") == 0)
+          name = name.substr(7);
+        if (name.find("class.") == 0)
+          name = name.substr(6);
+
+        // Map Closure environment destructors
+        if (name.find("Closure.") == 0) {
+          dropName = "Env." + name.substr(8) + ".dtor";
+        } else {
+          // Map standard struct destructors
+          dropName = name + ".destructor_ret_void";
+        }
+
+        // Sanitize the name so it matches the LLVM dialect renaming
+        for (char &c : dropName) {
+          if (c == '.' || c == '<' || c == '>')
+            c = '_';
+        }
+      }
+    }
+
+    // If the module has the destructor, attach it to the VTable
+    if (!dropName.empty() && module.lookupSymbol(dropName)) {
+      auto dropSymRef =
+          mlir::FlatSymbolRefAttr::get(rewriter.getContext(), dropName);
+      dropFn =
+          rewriter.create<mlir::LLVM::AddressOfOp>(loc, llvmPtrTy, dropSymRef);
+    }
 
     vtableStruct = rewriter.create<mlir::LLVM::InsertValueOp>(
         loc, vtableStruct, idVal, llvm::ArrayRef<int64_t>{0});
@@ -610,6 +671,31 @@ materializeLLVMConstant(mlir::ConversionPatternRewriter &rewriter,
   if (mlir::isa<mlir::UnitAttr>(attr)) {
     return rewriter.create<mlir::LLVM::ZeroOp>(loc, llvmType);
   }
+
+  if (auto arrAttr = mlir::dyn_cast<mlir::ArrayAttr>(attr)) {
+    mlir::Value aggregate = rewriter.create<mlir::LLVM::UndefOp>(loc, llvmType);
+    auto structTy = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(llvmType);
+    auto arrayTy = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(llvmType);
+
+    for (size_t i = 0; i < arrAttr.size(); ++i) {
+      mlir::Type elemTy;
+      if (structTy && i < structTy.getBody().size()) {
+        elemTy = structTy.getBody()[i];
+      } else if (arrayTy) {
+        elemTy = arrayTy.getElementType();
+      } else {
+        return rewriter.create<mlir::LLVM::ZeroOp>(loc, llvmType); // Failsafe
+      }
+
+      mlir::Value elemVal =
+          materializeLLVMConstant(rewriter, op, elemTy, arrAttr[i]);
+      aggregate = rewriter.create<mlir::LLVM::InsertValueOp>(
+          loc, aggregate, elemVal,
+          llvm::ArrayRef<int64_t>{static_cast<int64_t>(i)});
+    }
+    return aggregate;
+  }
+
   if (auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>(attr)) {
     return rewriter.create<mlir::LLVM::ConstantOp>(
         loc, llvmType,
@@ -618,7 +704,6 @@ materializeLLVMConstant(mlir::ConversionPatternRewriter &rewriter,
   if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(attr)) {
     if (mlir::isa<mlir::LLVM::LLVMPointerType>(llvmType)) {
       mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
-
       std::string nullTermStr = strAttr.getValue().str() + '\0';
       std::string globalName =
           ".str.lit." + std::to_string(llvm::hash_value(strAttr.getValue()));
@@ -673,17 +758,32 @@ materializeLLVMConstant(mlir::ConversionPatternRewriter &rewriter,
 static mlir::Value safeUpcastFPExt(mlir::ConversionPatternRewriter &rewriter,
                                    mlir::Location loc, mlir::Value val,
                                    mlir::Type destTy) {
-  if (auto constOp = val.getDefiningOp<mlir::LLVM::ConstantOp>()) {
-    if (auto floatAttr = mlir::dyn_cast<mlir::FloatAttr>(constOp.getValue())) {
-      llvm::APFloat apVal = floatAttr.getValue();
-      bool losesInfo;
-      apVal.convert(mlir::cast<mlir::FloatType>(destTy).getFloatSemantics(),
-                    llvm::APFloat::rmNearestTiesToEven, &losesInfo);
-      return rewriter.create<mlir::LLVM::ConstantOp>(
-          loc, destTy, rewriter.getFloatAttr(destTy, apVal));
+  if (val.getType() == destTy)
+    return val;
+
+  unsigned srcW = val.getType().getIntOrFloatBitWidth();
+  unsigned dstW = destTy.getIntOrFloatBitWidth();
+
+  // Prevent FPExt from crashing if someone passes a larger source
+  if (srcW > dstW) {
+    return rewriter.create<mlir::LLVM::FPTruncOp>(loc, destTy, val);
+  } else if (srcW < dstW) {
+    if (auto constOp = val.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+      if (auto floatAttr =
+              mlir::dyn_cast<mlir::FloatAttr>(constOp.getValue())) {
+        llvm::APFloat apVal = floatAttr.getValue();
+        bool losesInfo;
+        apVal.convert(mlir::cast<mlir::FloatType>(destTy).getFloatSemantics(),
+                      llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+        return rewriter.create<mlir::LLVM::ConstantOp>(
+            loc, destTy, rewriter.getFloatAttr(destTy, apVal));
+      }
     }
+    return rewriter.create<mlir::LLVM::FPExtOp>(loc, destTy, val);
+  } else {
+    // Same width but different type (e.g. f16 -> bf16)
+    return rewriter.create<mlir::LLVM::BitcastOp>(loc, destTy, val);
   }
-  return rewriter.create<mlir::LLVM::FPExtOp>(loc, destTy, val);
 }
 
 // Global Operations
@@ -712,6 +812,9 @@ struct GlobalOpLowering : public mlir::ConvertOpToLLVMPattern<IR::GlobalOp> {
       return rewriter.notifyMatchFailure(op, "Could not deduce global type");
 
     mlir::Type llvmType = typeConverter->convertType(elementType);
+    if (!llvmType)
+      return rewriter.notifyMatchFailure(op, "Global type conversion failed");
+
     mlir::LLVM::Linkage linkage = mlir::LLVM::Linkage::External;
     mlir::Attribute initAttr = op.getInitialValueAttr();
 
@@ -806,12 +909,17 @@ struct GlobalOpLowering : public mlir::ConvertOpToLLVMPattern<IR::GlobalOp> {
     }
 
     bool isExternDecl = op->hasAttr("moksha.is_extern");
+    bool needsZeroRegion = false;
 
     if (!isExternDecl && (!initAttr || mlir::isa<mlir::UnitAttr>(initAttr)) &&
         !generateVTableRegion) {
-      initAttr = rewriter.getZeroAttr(llvmType);
       if (linkage == mlir::LLVM::Linkage::External) {
         linkage = mlir::LLVM::Linkage::Internal;
+      }
+
+      initAttr = rewriter.getZeroAttr(llvmType);
+      if (!initAttr) {
+        needsZeroRegion = true;
       }
     } else if (isExternDecl) {
       initAttr = nullptr;
@@ -821,8 +929,14 @@ struct GlobalOpLowering : public mlir::ConvertOpToLLVMPattern<IR::GlobalOp> {
         op, llvmType, isConstant, linkage, name, initAttr, alignment, 0, false,
         threadLocal);
 
-    if (!initAttr && !generateVTableRegion && !isExternDecl) {
-      globalOp->setAttr("moksha.zeroinit", rewriter.getUnitAttr());
+    if (needsZeroRegion) {
+      mlir::Region &region = globalOp.getInitializerRegion();
+      mlir::Block *block = rewriter.createBlock(&region);
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(block);
+      mlir::Value zeroVal =
+          rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), llvmType);
+      rewriter.create<mlir::LLVM::ReturnOp>(op.getLoc(), zeroVal);
     }
 
     if (auto secAttr = op->getAttrOfType<mlir::StringAttr>("moksha.section")) {
@@ -855,14 +969,29 @@ struct GlobalOpLowering : public mlir::ConvertOpToLLVMPattern<IR::GlobalOp> {
                  : mlir::LLVM::LLVMPointerType::get(getContext());
         mlir::Value elemVal;
 
-        if (mlir::isa<mlir::UnitAttr>(elemAttr)) {
-          elemVal = rewriter.create<mlir::LLVM::ZeroOp>(loc, fieldTy);
+        if (auto symRef = mlir::dyn_cast<mlir::FlatSymbolRefAttr>(elemAttr)) {
+          std::string rawName = symRef.getValue().str();
+          for (char &c : rawName) {
+            if (c == '.' || c == '<' || c == '>')
+              c = '_';
+          }
+          auto cleanSymRef =
+              mlir::FlatSymbolRefAttr::get(getContext(), rawName);
+
+          elemVal = rewriter.create<mlir::LLVM::AddressOfOp>(
+              loc, mlir::LLVM::LLVMPointerType::get(getContext()), cleanSymRef);
+
+          // Cast opaque function pointers to the expected struct field type
+          if (elemVal.getType() != fieldTy) {
+            elemVal =
+                rewriter.create<mlir::LLVM::BitcastOp>(loc, fieldTy, elemVal);
+          }
         } else if (auto innerArr = mlir::dyn_cast<mlir::ArrayAttr>(elemAttr)) {
           elemVal = rewriter.create<mlir::LLVM::UndefOp>(loc, fieldTy);
           for (size_t j = 0; j < innerArr.size(); ++j) {
-            if (auto symRef =
+            if (auto innerSymRef =
                     mlir::dyn_cast<mlir::FlatSymbolRefAttr>(innerArr[j])) {
-              std::string rawName = symRef.getValue().str();
+              std::string rawName = innerSymRef.getValue().str();
               for (char &c : rawName) {
                 if (c == '.' || c == '<' || c == '>')
                   c = '_';
@@ -878,6 +1007,9 @@ struct GlobalOpLowering : public mlir::ConvertOpToLLVMPattern<IR::GlobalOp> {
                   llvm::ArrayRef<int64_t>{static_cast<int64_t>(j)});
             }
           }
+        } else {
+          elemVal =
+              materializeLLVMConstant(rewriter, globalOp, fieldTy, elemAttr);
         }
 
         if (elemVal) {
@@ -1364,17 +1496,6 @@ struct GetElementPtrOpLowering
         pointeeTy = rewriter.getI8Type();
       } else {
         pointeeTy = typeConverter->convertType(pointee);
-
-        if (mlir::isa<mlir::LLVM::LLVMPointerType>(pointeeTy)) {
-          std::string typeStr;
-          llvm::raw_string_ostream os(typeStr);
-          pointee.print(os);
-          if (typeStr.find("slice") != std::string::npos ||
-              typeStr.find("array") != std::string::npos) {
-            pointeeTy = mlir::LLVM::LLVMStructType::getLiteral(
-                getContext(), {rewriter.getI64Type(), rewriter.getI64Type()});
-          }
-        }
       }
 
       if (!pointeeTy) {
@@ -2258,8 +2379,14 @@ struct CastOpLowering : public mlir::ConvertOpToLLVMPattern<IR::CastOp> {
           rewriter.create<mlir::LLVM::FDivOp>(loc, f64Ty, mantissaF64, divVal);
 
       if (dstType != f64Ty) {
-        rewriter.replaceOpWithNewOp<mlir::LLVM::FPTruncOp>(op, dstType,
+        unsigned dstW = dstType.getIntOrFloatBitWidth();
+        if (dstW < 64) {
+          rewriter.replaceOpWithNewOp<mlir::LLVM::FPTruncOp>(op, dstType,
+                                                             resultF64);
+        } else {
+          rewriter.replaceOpWithNewOp<mlir::LLVM::FPExtOp>(op, dstType,
                                                            resultF64);
+        }
       } else {
         rewriter.replaceOp(op, resultF64);
       }
@@ -2483,6 +2610,10 @@ struct CastOpLowering : public mlir::ConvertOpToLLVMPattern<IR::CastOp> {
         }
         currentVal = rewriter.create<mlir::LLVM::FPTruncOp>(
             op.getLoc(), dstType, currentVal);
+      } else if (srcType != dstType) {
+        // Safety check for identical widths but differing types
+        currentVal = rewriter.create<mlir::LLVM::BitcastOp>(
+            op.getLoc(), dstType, currentVal);
       }
 
       bool isTargetQuarter = mlir::isa<mlir::Float8E5M2Type>(origDstType) ||
@@ -2595,6 +2726,139 @@ struct CastOpLowering : public mlir::ConvertOpToLLVMPattern<IR::CastOp> {
     } else {
       rewriter.replaceOp(op, adaptor.getValue());
     }
+    return mlir::success();
+  }
+};
+
+struct FPExtOpLowering : public mlir::ConvertOpToLLVMPattern<IR::FPExtOp> {
+  using ConvertOpToLLVMPattern<IR::FPExtOp>::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(IR::FPExtOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::Type dstType = typeConverter->convertType(op.getType());
+    if (!mlir::isa<mlir::FloatType>(dstType))
+      return mlir::failure();
+
+    mlir::Value operand = adaptor.getOperand();
+    mlir::Type srcType = operand.getType();
+    if (!mlir::isa<mlir::FloatType>(srcType))
+      return mlir::failure();
+
+    // WINDOWS MINGW FPU TRAP BYPASS
+    if (auto constOp = operand.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+      if (auto floatAttr =
+              mlir::dyn_cast<mlir::FloatAttr>(constOp.getValue())) {
+        auto targetTy = mlir::cast<mlir::FloatType>(dstType);
+        llvm::APFloat apVal = floatAttr.getValue();
+        bool losesInfo;
+        apVal.convert(targetTy.getFloatSemantics(),
+                      llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+
+        rewriter.replaceOpWithNewOp<mlir::LLVM::ConstantOp>(
+            op, dstType, rewriter.getFloatAttr(dstType, apVal));
+        return mlir::success();
+      }
+    }
+
+    unsigned srcW = srcType.getIntOrFloatBitWidth();
+    unsigned dstW = dstType.getIntOrFloatBitWidth();
+    mlir::Value currentVal;
+
+    if (srcW == dstW) {
+      currentVal = (srcType == dstType)
+                       ? operand
+                       : rewriter.create<mlir::LLVM::BitcastOp>(
+                             op.getLoc(), dstType, operand);
+    } else if (srcW > dstW) {
+      currentVal =
+          rewriter.create<mlir::LLVM::FPTruncOp>(op.getLoc(), dstType, operand);
+    } else {
+      currentVal =
+          rewriter.create<mlir::LLVM::FPExtOp>(op.getLoc(), dstType, operand);
+    }
+
+    rewriter.replaceOp(op, currentVal);
+    return mlir::success();
+  }
+};
+
+struct FPTruncOpLowering : public mlir::ConvertOpToLLVMPattern<IR::FPTruncOp> {
+  using ConvertOpToLLVMPattern<IR::FPTruncOp>::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(IR::FPTruncOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::Type dstType = typeConverter->convertType(op.getType());
+    if (!mlir::isa<mlir::FloatType>(dstType))
+      return mlir::failure();
+
+    mlir::Value operand = adaptor.getOperand();
+    mlir::Type srcType = operand.getType();
+    if (!mlir::isa<mlir::FloatType>(srcType))
+      return mlir::failure();
+
+    // WINDOWS MINGW FPU TRAP BYPASS
+    if (auto constOp = operand.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+      if (auto floatAttr =
+              mlir::dyn_cast<mlir::FloatAttr>(constOp.getValue())) {
+        auto targetTy = mlir::cast<mlir::FloatType>(dstType);
+        llvm::APFloat apVal = floatAttr.getValue();
+        bool losesInfo;
+        apVal.convert(targetTy.getFloatSemantics(),
+                      llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+
+        mlir::Type origDstType = op.getType();
+        bool isTargetQuarter = mlir::isa<mlir::Float8E5M2Type>(origDstType) ||
+                               mlir::isa<mlir::Float8E4M3FNType>(origDstType);
+        if (isTargetQuarter && dstType.isF16()) {
+          llvm::APInt api = apVal.bitcastToAPInt();
+          uint16_t maskVal =
+              mlir::isa<mlir::Float8E5M2Type>(origDstType) ? 0xFF00 : 0xFF80;
+          api &= maskVal;
+          apVal = llvm::APFloat(targetTy.getFloatSemantics(), api);
+        }
+
+        rewriter.replaceOpWithNewOp<mlir::LLVM::ConstantOp>(
+            op, dstType, rewriter.getFloatAttr(dstType, apVal));
+        return mlir::success();
+      }
+    }
+
+    unsigned srcW = srcType.getIntOrFloatBitWidth();
+    unsigned dstW = dstType.getIntOrFloatBitWidth();
+    mlir::Value currentVal;
+
+    if (srcW == dstW) {
+      currentVal = (srcType == dstType)
+                       ? operand
+                       : rewriter.create<mlir::LLVM::BitcastOp>(
+                             op.getLoc(), dstType, operand);
+    } else if (srcW < dstW) {
+      currentVal =
+          rewriter.create<mlir::LLVM::FPExtOp>(op.getLoc(), dstType, operand);
+    } else {
+      currentVal =
+          rewriter.create<mlir::LLVM::FPTruncOp>(op.getLoc(), dstType, operand);
+    }
+
+    mlir::Type origDstType = op.getType();
+    if (dstW == 16 && (mlir::isa<mlir::Float8E5M2Type>(origDstType) ||
+                       mlir::isa<mlir::Float8E4M3FNType>(origDstType))) {
+      auto i16Ty = rewriter.getI16Type();
+      mlir::Value asInt = rewriter.create<mlir::LLVM::BitcastOp>(
+          op.getLoc(), i16Ty, currentVal);
+      uint16_t maskVal =
+          mlir::isa<mlir::Float8E5M2Type>(origDstType) ? 0xFF00 : 0xFF80;
+      mlir::Value mask = rewriter.create<mlir::LLVM::ConstantOp>(
+          op.getLoc(), i16Ty, rewriter.getI16IntegerAttr(maskVal));
+      mlir::Value masked =
+          rewriter.create<mlir::LLVM::AndOp>(op.getLoc(), i16Ty, asInt, mask);
+      currentVal =
+          rewriter.create<mlir::LLVM::BitcastOp>(op.getLoc(), dstType, masked);
+    }
+
+    rewriter.replaceOp(op, currentVal);
     return mlir::success();
   }
 };
@@ -2900,6 +3164,7 @@ struct CmpOpLowering : public mlir::ConvertOpToLLVMPattern<IR::CmpOp> {
                   mlir::ConversionPatternRewriter &rewriter) const override {
 
     mlir::Type ty = adaptor.getLhs().getType();
+    mlir::Type origTy = op.getLhs().getType();
     uint32_t pred = op.getPredicate(); // 0=EQ, 1=NE, 2=LT, 3=LE, 4=GT, 5=GE,
                                        // 6=ULT, 7=ULE, 8=UGT, 9=UGE
 
@@ -3142,7 +3407,7 @@ struct CmpOpLowering : public mlir::ConvertOpToLLVMPattern<IR::CmpOp> {
                                                       zero);
 
     } else {
-      bool isUnsigned = ty.isUnsignedInteger() || ty.isInteger(1);
+      bool isUnsigned = origTy.isUnsignedInteger() || origTy.isInteger(1);
       mlir::LLVM::ICmpPredicate llvmPred;
       switch (pred) {
       case 0:
@@ -3264,7 +3529,6 @@ struct ReleaseOpLowering : public mlir::ConvertOpToLLVMPattern<IR::ReleaseOp> {
         mlir::Value envPtr = rewriter.create<mlir::LLVM::ExtractValueOp>(
             loc, val, llvm::ArrayRef<int64_t>{1});
 
-        // Load dynamic destructor
         mlir::Block *currentBlock = rewriter.getInsertionBlock();
         mlir::Block *mergeBlock =
             rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
@@ -3288,6 +3552,23 @@ struct ReleaseOpLowering : public mlir::ConvertOpToLLVMPattern<IR::ReleaseOp> {
         rewriter.setInsertionPointToStart(mergeBlock);
         dropFuncPtr = mergeBlock->addArgument(llvmPtrTy, loc);
         val = envPtr;
+      } else if (mlir::isa<IR::AnyType>(origTy)) {
+        mlir::Value dataPtr = rewriter.create<mlir::LLVM::ExtractValueOp>(
+            loc, val, llvm::ArrayRef<int64_t>{0});
+        mlir::Value vtablePtr = rewriter.create<mlir::LLVM::ExtractValueOp>(
+            loc, val, llvm::ArrayRef<int64_t>{1});
+
+        auto i32Ty = rewriter.getI32Type();
+        auto vtableStructTy = mlir::LLVM::LLVMStructType::getLiteral(
+            getContext(), {i32Ty, llvmPtrTy, llvmPtrTy, llvmPtrTy});
+
+        mlir::Value dropGep = rewriter.create<mlir::LLVM::GEPOp>(
+            loc, llvmPtrTy, vtableStructTy, vtablePtr,
+            llvm::ArrayRef<mlir::LLVM::GEPArg>{0, 3});
+
+        dropFuncPtr =
+            rewriter.create<mlir::LLVM::LoadOp>(loc, llvmPtrTy, dropGep);
+        val = dataPtr;
       } else {
         val = rewriter.create<mlir::LLVM::ExtractValueOp>(
             loc, val, llvm::ArrayRef<int64_t>{0});
@@ -3658,6 +3939,78 @@ struct CustomCallOpLowering
       }
     }
 
+    /* @brief Consume the exception record from the ABI exception storage */
+    if (callee == "moksha_rt_consume_exception") {
+      auto loc = op.getLoc();
+      mlir::Type llvmPtrTy = mlir::LLVM::LLVMPointerType::get(getContext());
+      mlir::Type i32Ty = rewriter.getI32Type();
+      mlir::Type structTy = mlir::LLVM::LLVMStructType::getLiteral(
+          getContext(), {llvmPtrTy, i32Ty});
+
+      // Retrieve the authentic LLVM landingpad result from trampoline storage
+      mlir::Value storage = getLpadStorage(rewriter, loc, op, structTy);
+      mlir::Value authenticLpad =
+          rewriter.create<mlir::LLVM::LoadOp>(loc, structTy, storage);
+
+      // Extract the OS/ABI-level exception pointer (Index 0)
+      mlir::Value abiExPtr = rewriter.create<mlir::LLVM::ExtractValueOp>(
+          loc, authenticLpad, llvm::ArrayRef<int64_t>{0});
+
+      // Formally begin and end the C++ catch to satisfy the SEH State Machine
+      createRuntimeCall(rewriter, loc, llvmPtrTy, "__cxa_begin_catch",
+                        {abiExPtr});
+      createRuntimeCall(rewriter, loc, "__cxa_end_catch", mlir::TypeRange{},
+                        {});
+
+      // Manually lower the generic call to consume the Moksha payload
+      llvm::SmallVector<mlir::Type, 1> resultTypes;
+      if (mlir::failed(
+              typeConverter->convertTypes(op.getResultTypes(), resultTypes)))
+        return mlir::failure();
+
+      auto llvmCall = rewriter.create<mlir::LLVM::CallOp>(
+          loc, resultTypes, op.getCalleeAttr(), mlir::ValueRange{});
+      auto llvmFnTy =
+          mlir::LLVM::LLVMFunctionType::get(resultTypes[0], {}, false);
+      llvmCall->setAttr("callee_type", mlir::TypeAttr::get(llvmFnTy));
+
+      // Sniff the bitcast type and inject the missing frontend retains manually
+      mlir::Type mokshaPayloadTy = nullptr;
+      for (auto user : op.getResult(0).getUsers()) {
+        if (auto bc = mlir::dyn_cast<IR::BitcastOp>(user)) {
+          mokshaPayloadTy = bc.getType();
+          break;
+        }
+      }
+
+      if (mokshaPayloadTy) {
+        mlir::Type innerTy = nullptr;
+        if (auto ptrTy = mlir::dyn_cast<IR::PointerType>(mokshaPayloadTy)) {
+          innerTy = typeConverter->convertType(ptrTy.getPointee());
+        }
+
+        if (innerTy && mlir::isa<mlir::LLVM::LLVMStructType>(innerTy)) {
+          auto stTy = mlir::cast<mlir::LLVM::LLVMStructType>(innerTy);
+          mlir::Value structVal = rewriter.create<mlir::LLVM::LoadOp>(
+              loc, stTy, llvmCall.getResult());
+
+          for (size_t i = 0; i < stTy.getBody().size(); ++i) {
+            if (mlir::isa<mlir::LLVM::LLVMPointerType>(stTy.getBody()[i])) {
+              mlir::Value fieldVal =
+                  rewriter.create<mlir::LLVM::ExtractValueOp>(
+                      loc, structVal,
+                      llvm::ArrayRef<int64_t>{static_cast<int64_t>(i)});
+              createRuntimeCall(rewriter, loc, "moksha_rt_retain", {},
+                                {fieldVal});
+            }
+          }
+        }
+      }
+
+      rewriter.replaceOp(op, llvmCall.getResults());
+      return mlir::success();
+    }
+
     // PREVENT STACK-FREE CRASHES
     if (callee == "__moksha_free") {
       auto loc = op.getLoc();
@@ -3984,7 +4337,13 @@ struct CustomCallOpLowering
       auto loc = op.getLoc();
       mlir::Type f32Ty = rewriter.getF32Type();
       mlir::Value arg = adaptor.getOperands()[0];
-      mlir::Value f32Val = safeUpcastFPExt(rewriter, loc, arg, f32Ty);
+
+      mlir::Type f16Ty = rewriter.getF16Type();
+      mlir::Value loadedVal =
+          rewriter.create<mlir::LLVM::LoadOp>(loc, f16Ty, arg);
+
+      mlir::Value f32Val = safeUpcastFPExt(rewriter, loc, loadedVal, f32Ty);
+
       mlir::Type llvmPtrTy = mlir::LLVM::LLVMPointerType::get(getContext());
       auto module = op->getParentOfType<mlir::ModuleOp>();
       std::string safeSymbolName = (callee + "_abi").str();
@@ -4144,6 +4503,13 @@ struct SpawnOpLowering : public mlir::ConvertOpToLLVMPattern<IR::SpawnOp> {
     mlir::Value closurePtr = adaptor.getClosure();
 
     if (!mlir::isa<mlir::LLVM::LLVMPointerType>(closurePtr.getType())) {
+      mlir::Value envPtr = rewriter.create<mlir::LLVM::ExtractValueOp>(
+          loc, closurePtr, llvm::ArrayRef<int64_t>{1});
+      if (envPtr.getType() != opaquePtrTy) {
+        envPtr =
+            rewriter.create<mlir::LLVM::BitcastOp>(loc, opaquePtrTy, envPtr);
+      }
+      createRuntimeCall(rewriter, loc, "moksha_rt_retain", {}, {envPtr});
       mlir::Type i32Ty = rewriter.getI32Type();
       mlir::Type i64Ty = rewriter.getI64Type();
       mlir::Value size = rewriter.create<mlir::LLVM::ConstantOp>(
@@ -4194,6 +4560,9 @@ struct AwaitOpLowering : public mlir::ConvertOpToLLVMPattern<IR::AwaitOp> {
     auto funcOp = op->getParentOfType<mlir::LLVM::LLVMFuncOp>();
 
     if (funcOp.getName() == "main" || funcOp.getName() == "__moksha_main") {
+      createRuntimeCall(rewriter, loc, "moksha_rt_retain", {},
+                        {adaptor.getPromise()});
+
       mlir::Value blockRes =
           createRuntimeCall(rewriter, loc, llvmI8PtrTy, "moksha_rt_block_on",
                             {adaptor.getPromise()});
@@ -4247,6 +4616,9 @@ struct AwaitOpLowering : public mlir::ConvertOpToLLVMPattern<IR::AwaitOp> {
         mlir::SymbolRefAttr::get(getContext(), "llvm.coro.save"),
         mlir::ValueRange(llvm::ArrayRef<mlir::Value>(saveArgs)));
     coroSave->setAttr("callee_type", mlir::TypeAttr::get(saveFnTy));
+
+    createRuntimeCall(rewriter, loc, "moksha_rt_retain", {},
+                      {adaptor.getPromise()});
     createRuntimeCall(rewriter, loc, "moksha_rt_register_await",
                       mlir::TypeRange{},
                       {adaptor.getPromise(), nullHandle.getResult()});
@@ -4356,6 +4728,10 @@ struct AwaitOpLowering : public mlir::ConvertOpToLLVMPattern<IR::AwaitOp> {
                                                 payloadFnTy);
       }
 
+      // Retain before payload extraction (unwind path)
+      createRuntimeCall(rewriter, loc, "moksha_rt_retain", {},
+                        {adaptor.getPromise()});
+
       auto invokeOp = rewriter.create<mlir::LLVM::InvokeOp>(
           loc, llvmI8PtrTy,
           mlir::SymbolRefAttr::get(getContext(), "moksha_rt_await_payload"),
@@ -4369,6 +4745,10 @@ struct AwaitOpLowering : public mlir::ConvertOpToLLVMPattern<IR::AwaitOp> {
       payloadPtrResult = invokeOp.getResult();
       rewriter.setInsertionPointToStart(normalDest);
     } else {
+      // Retain before payload extraction (normal path)
+      createRuntimeCall(rewriter, loc, "moksha_rt_retain", {},
+                        {adaptor.getPromise()});
+
       payloadPtrResult =
           createRuntimeCall(rewriter, loc, llvmI8PtrTy,
                             "moksha_rt_await_payload", {adaptor.getPromise()});
@@ -4785,6 +5165,7 @@ struct SafeDivModOpLowering : public mlir::ConvertOpToLLVMPattern<OpType> {
     mlir::Value lhs = adaptor.getLhs();
     mlir::Value rhs = adaptor.getRhs();
     mlir::Type type = lhs.getType();
+    mlir::Type origTy = op.getLhs().getType();
 
     if (auto lhsConst =
             adaptor.getLhs().template getDefiningOp<mlir::LLVM::ConstantOp>()) {
@@ -4827,10 +5208,8 @@ struct SafeDivModOpLowering : public mlir::ConvertOpToLLVMPattern<OpType> {
               llvm::APInt rVal = rAttr.getValue();
               llvm::APInt resVal;
 
-              bool isUnsigned = false;
-              if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(type))
-                isUnsigned = intTy.isUnsigned();
-
+              bool isUnsigned =
+                  origTy.isUnsignedInteger() || origTy.isInteger(1);
               bool canFold = true;
               if constexpr (std::is_same_v<OpType, IR::DivOp>) {
                 if (rVal.isZero())
@@ -4907,6 +5286,8 @@ struct SafeDivModOpLowering : public mlir::ConvertOpToLLVMPattern<OpType> {
 
     // Safe Integer Division (Zero-checked)
     if (llvm::isa<mlir::IntegerType>(type)) {
+      bool isUnsigned = origTy.isUnsignedInteger() || origTy.isInteger(1);
+
       mlir::Value zero = rewriter.create<mlir::LLVM::ConstantOp>(
           loc, type, rewriter.getIntegerAttr(type, 0));
       mlir::Value one = rewriter.create<mlir::LLVM::ConstantOp>(
@@ -4916,7 +5297,23 @@ struct SafeDivModOpLowering : public mlir::ConvertOpToLLVMPattern<OpType> {
           loc, mlir::LLVM::ICmpPredicate::eq, rhs, zero);
       mlir::Value safeRhs =
           rewriter.create<mlir::LLVM::SelectOp>(loc, isZero, one, rhs);
-      mlir::Value safeDiv = rewriter.create<IntLLVMOp>(loc, type, lhs, safeRhs);
+      mlir::Value safeDiv;
+      if constexpr (std::is_same_v<OpType, IR::DivOp>) {
+        if (isUnsigned)
+          safeDiv =
+              rewriter.create<mlir::LLVM::UDivOp>(loc, type, lhs, safeRhs);
+        else
+          safeDiv =
+              rewriter.create<mlir::LLVM::SDivOp>(loc, type, lhs, safeRhs);
+      } else if constexpr (std::is_same_v<OpType, IR::ModOp>) {
+        if (isUnsigned)
+          safeDiv =
+              rewriter.create<mlir::LLVM::URemOp>(loc, type, lhs, safeRhs);
+        else
+          safeDiv =
+              rewriter.create<mlir::LLVM::SRemOp>(loc, type, lhs, safeRhs);
+      }
+
       mlir::Value finalRes =
           rewriter.create<mlir::LLVM::SelectOp>(loc, isZero, zero, safeDiv);
 
@@ -4924,6 +5321,27 @@ struct SafeDivModOpLowering : public mlir::ConvertOpToLLVMPattern<OpType> {
       return mlir::success();
     }
     return mlir::failure();
+  }
+};
+
+struct ShrOpLowering : public mlir::ConvertOpToLLVMPattern<IR::ShrOp> {
+  using ConvertOpToLLVMPattern<IR::ShrOp>::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(IR::ShrOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::Type origTy = op.getLhs().getType();
+    bool isUnsigned = origTy.isUnsignedInteger() || origTy.isInteger(1);
+    mlir::Type resTy = this->typeConverter->convertType(op.getType());
+
+    if (isUnsigned) {
+      rewriter.replaceOpWithNewOp<mlir::LLVM::LShrOp>(
+          op, resTy, adaptor.getLhs(), adaptor.getRhs());
+    } else {
+      rewriter.replaceOpWithNewOp<mlir::LLVM::AShrOp>(
+          op, resTy, adaptor.getLhs(), adaptor.getRhs());
+    }
+    return mlir::success();
   }
 };
 
@@ -5052,7 +5470,8 @@ struct ConvertMokshaToLLVMPass
         InvokeOpLowering, PowOpLowering, SpawnOpLowering, AwaitOpLowering,
         AtomicStoreOpLowering, ResumeOpLowering, AtomicLoadOpLowering,
         AtomicRMWOpLowering, AtomicCmpXchgOpLowering, FenceOpLowering,
-        AddOpLowering, ThrowOpLowering, LandingPadOpLowering>(typeConverter);
+        AddOpLowering, ThrowOpLowering, LandingPadOpLowering, ShrOpLowering,
+        FPExtOpLowering, FPTruncOpLowering>(typeConverter);
 
     // Math & Bitwise
     patterns.add<
@@ -5062,7 +5481,6 @@ struct ConvertMokshaToLLVMPass
         BitwiseOpLowering<IR::OrOp, mlir::LLVM::OrOp>,
         BitwiseOpLowering<IR::XorOp, mlir::LLVM::XOrOp>,
         BitwiseOpLowering<IR::ShlOp, mlir::LLVM::ShlOp>,
-        BitwiseOpLowering<IR::ShrOp, mlir::LLVM::AShrOp>,
         SafeDivModOpLowering<IR::DivOp, mlir::LLVM::SDivOp, mlir::LLVM::FDivOp>,
         SafeDivModOpLowering<IR::ModOp, mlir::LLVM::SRemOp,
                              mlir::LLVM::FRemOp>>(typeConverter);

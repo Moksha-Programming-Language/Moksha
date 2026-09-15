@@ -56,7 +56,7 @@ void test_table_iteration() {
     // Expected: version -> 1.2 \n stable -> true
 
     // 3. Table Literal (Direct iteration)
-    for (string k, v in {"ID": 500}) {
+    for (string k, int v in {"ID": 500}) {
         println(v);
     }
     // Expected: 500

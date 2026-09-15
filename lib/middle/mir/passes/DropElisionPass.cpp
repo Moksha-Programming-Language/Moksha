@@ -6,6 +6,7 @@
 #include "moksha/MIR/MIRModule.h"
 #include "llvm/Support/Casting.h"
 #include <algorithm>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -43,6 +44,60 @@ MIRValue *getBaseAlloca(MIRValue *val) {
       break;
   }
   return nullptr;
+}
+
+/* @brief Checks if the given type is ARC material (shared or owned). */
+bool isARCMaterial(const hir::HIRType *ty) {
+  if (!ty)
+    return false;
+  const hir::HIRType *coreTy = ty;
+
+  while (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(coreTy)) {
+    if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+        ptrTy->getOwnership() == hir::Ownership::Owned) {
+      return true;
+    }
+    coreTy = ptrTy->getPointee();
+  }
+  if (auto *refTy = llvm::dyn_cast_or_null<hir::ReferenceType>(coreTy)) {
+    coreTy = refTy->getInner();
+  }
+  if (auto *nullTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(coreTy)) {
+    coreTy = nullTy->getInner();
+  }
+
+  if (!coreTy)
+    return false;
+
+  auto kind = coreTy->getKind();
+  if (kind == hir::TypeKind::Slice || kind == hir::TypeKind::Array ||
+      kind == hir::TypeKind::String || kind == hir::TypeKind::Map ||
+      kind == hir::TypeKind::Any || kind == hir::TypeKind::Closure ||
+      kind == hir::TypeKind::Function || kind == hir::TypeKind::Promise) {
+    return true;
+  }
+
+  if (auto *stTy = llvm::dyn_cast_or_null<hir::StructType>(coreTy)) {
+    if (stTy->isRefClass() ||
+        coreTy->toString().find("class.") != std::string::npos) {
+      return true;
+    }
+  }
+
+  if (auto *stTy = llvm::dyn_cast_or_null<hir::StructType>(coreTy)) {
+    return true;
+  }
+
+  std::string name = coreTy->toString();
+  if (name.find("shared ") != std::string::npos ||
+      name.find("Closure.") != std::string::npos ||
+      name.find("closure") != std::string::npos ||
+      name.find("Arc<") != std::string::npos ||
+      name.find("Box<") != std::string::npos) {
+    return true;
+  }
+
+  return false;
 }
 
 } // namespace
@@ -97,80 +152,71 @@ bool DropElisionPass::runOnFunction(MIRFunction *F) {
         MIRInst *inst = instPtr.get();
 
         if (auto *store = llvm::dyn_cast_or_null<StoreInst>(inst)) {
+          bool isDestSpill = false;
           if (MIRValue *destAlloca = getBaseAlloca(store->getPointer())) {
             currentOut.erase(destAlloca);
+            if (destAlloca->getName().find(".spill") != std::string::npos) {
+              isDestSpill = true;
+            }
           }
 
-          if (auto *sourceLoad =
-                  llvm::dyn_cast_or_null<LoadInst>(store->getValue())) {
-            std::string loadName = sourceLoad->getName();
-            if (loadName.find("cleanup") == std::string::npos &&
-                loadName.find("old") == std::string::npos) {
-              if (sourceLoad->getBorrowKind() != BorrowKind::View) {
-
-                bool isShared = false;
-                const hir::HIRType *checkTy = sourceLoad->getType();
-                if (auto *ptrTy =
-                        llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
-                  if (ptrTy->getOwnership() == hir::Ownership::Shared)
-                    isShared = true;
-                } else if (checkTy) {
-                  auto kind = checkTy->getKind();
-                  if (kind == hir::TypeKind::Slice ||
-                      kind == hir::TypeKind::Array ||
-                      kind == hir::TypeKind::String ||
-                      kind == hir::TypeKind::Map ||
-                      kind == hir::TypeKind::Any ||
-                      kind == hir::TypeKind::Promise ||
-                      checkTy->toString().find("shared ") !=
-                          std::string::npos) {
-                    isShared = true;
-                  }
-                }
-
-                if (!isShared) {
+          if (!isDestSpill) {
+            if (auto *sourceLoad =
+                    llvm::dyn_cast_or_null<LoadInst>(store->getValue())) {
+              std::string loadName = sourceLoad->getName();
+              if (loadName.find("cleanup") == std::string::npos &&
+                  loadName.find("old") == std::string::npos) {
+                if (sourceLoad->getBorrowKind() != BorrowKind::View) {
                   if (MIRValue *sourceAlloca =
                           getBaseAlloca(sourceLoad->getPointer())) {
-                    currentOut.insert(sourceAlloca);
+                    // Check the true underlying type instead of the loaded cast
+                    bool isEnv = sourceAlloca->getName().find("Env.lambda") !=
+                                     std::string::npos ||
+                                 (sourceAlloca->getType() &&
+                                  sourceAlloca->getType()->toString().find(
+                                      "Env.lambda") != std::string::npos);
+                    bool isTemp =
+                        !isEnv && (sourceAlloca->getName().find(".stack") !=
+                                       std::string::npos ||
+                                   sourceAlloca->getName().find(".temp") !=
+                                       std::string::npos ||
+                                   sourceAlloca->getName().find("temp.") !=
+                                       std::string::npos ||
+                                   sourceAlloca->getName().find(
+                                       "new.obj.stack") != std::string::npos);
+                    if (!isARCMaterial(sourceAlloca->getType()) || isTemp) {
+                      currentOut.insert(sourceAlloca);
+                    }
                   }
                 }
               }
             }
           }
-
-          if (auto *call = llvm::dyn_cast_or_null<CallInst>(inst)) {
-            for (auto *arg : call->getArgs()) {
-              if (auto *argLoad = llvm::dyn_cast_or_null<LoadInst>(arg)) {
-                std::string argName = argLoad->getName();
-                if (argName.find("cleanup") == std::string::npos &&
-                    argName.find("old") == std::string::npos) {
-                  if (argLoad->getBorrowKind() != BorrowKind::View) {
-                    bool isShared = false;
-                    const hir::HIRType *checkTy = argLoad->getType();
-
-                    if (auto *ptrTy =
-                            llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
-                      if (ptrTy->getOwnership() == hir::Ownership::Shared)
-                        isShared = true;
-                    } else if (checkTy) {
-                      auto kind = checkTy->getKind();
-                      if (kind == hir::TypeKind::Slice ||
-                          kind == hir::TypeKind::Array ||
-                          kind == hir::TypeKind::String ||
-                          kind == hir::TypeKind::Map ||
-                          kind == hir::TypeKind::Any ||
-                          kind == hir::TypeKind::Promise ||
-                          checkTy->toString().find("shared ") !=
-                              std::string::npos) {
-                        isShared = true;
-                      }
-                    }
-
-                    if (!isShared) {
-                      if (MIRValue *sourceAlloca =
-                              getBaseAlloca(argLoad->getPointer())) {
-                        currentOut.insert(sourceAlloca);
-                      }
+        } else if (auto *call = llvm::dyn_cast_or_null<CallInst>(inst)) {
+          for (auto *arg : call->getArgs()) {
+            if (auto *argLoad = llvm::dyn_cast_or_null<LoadInst>(arg)) {
+              std::string argName = argLoad->getName();
+              if (argName.find("cleanup") == std::string::npos &&
+                  argName.find("old") == std::string::npos) {
+                if (argLoad->getBorrowKind() != BorrowKind::View) {
+                  if (MIRValue *sourceAlloca =
+                          getBaseAlloca(argLoad->getPointer())) {
+                    bool isEnv = sourceAlloca->getName().find("Env.lambda") !=
+                                     std::string::npos ||
+                                 (sourceAlloca->getType() &&
+                                  sourceAlloca->getType()->toString().find(
+                                      "Env.lambda") != std::string::npos);
+                    bool isTemp =
+                        !isEnv && (sourceAlloca->getName().find(".stack") !=
+                                       std::string::npos ||
+                                   sourceAlloca->getName().find(".temp") !=
+                                       std::string::npos ||
+                                   sourceAlloca->getName().find("temp.") !=
+                                       std::string::npos ||
+                                   sourceAlloca->getName().find(
+                                       "new.obj.stack") != std::string::npos);
+                    if (!isARCMaterial(sourceAlloca->getType()) || isTemp) {
+                      currentOut.insert(sourceAlloca);
                     }
                   }
                 }
@@ -182,31 +228,23 @@ bool DropElisionPass::runOnFunction(MIRFunction *F) {
             if (auto *argLoad = llvm::dyn_cast_or_null<LoadInst>(arg)) {
               if (argLoad->getName() != "cleanup_val" &&
                   argLoad->getBorrowKind() != BorrowKind::View) {
-
-                bool isShared = false;
-                const hir::HIRType *checkTy = argLoad->getType();
-
-                if (auto *ptrTy =
-                        llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
-                  if (ptrTy->getOwnership() == hir::Ownership::Shared)
-                    isShared = true;
-                } else if (checkTy) {
-                  auto kind = checkTy->getKind();
-                  if (kind == hir::TypeKind::Slice ||
-                      kind == hir::TypeKind::Array ||
-                      kind == hir::TypeKind::String ||
-                      kind == hir::TypeKind::Map ||
-                      kind == hir::TypeKind::Any ||
-                      kind == hir::TypeKind::Promise ||
-                      checkTy->toString().find("shared ") !=
-                          std::string::npos) {
-                    isShared = true;
-                  }
-                }
-
-                if (!isShared) {
-                  if (MIRValue *sourceAlloca =
-                          getBaseAlloca(argLoad->getPointer())) {
+                if (MIRValue *sourceAlloca =
+                        getBaseAlloca(argLoad->getPointer())) {
+                  bool isEnv = sourceAlloca->getName().find("Env.lambda") !=
+                                   std::string::npos ||
+                               (sourceAlloca->getType() &&
+                                sourceAlloca->getType()->toString().find(
+                                    "Env.lambda") != std::string::npos);
+                  bool isTemp =
+                      !isEnv && (sourceAlloca->getName().find(".stack") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find(".temp") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find("temp.") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find(
+                                     "new.obj.stack") != std::string::npos);
+                  if (!isARCMaterial(sourceAlloca->getType()) || isTemp) {
                     currentOut.insert(sourceAlloca);
                   }
                 }
@@ -236,17 +274,40 @@ bool DropElisionPass::runOnFunction(MIRFunction *F) {
       bool elideInstruction = false;
 
       if (auto *store = llvm::dyn_cast_or_null<StoreInst>(inst)) {
+        bool isDestSpill = false;
         if (MIRValue *destAlloca = getBaseAlloca(store->getPointer())) {
           movedAllocas.erase(destAlloca);
+          if (destAlloca->getName().find(".spill") != std::string::npos) {
+            isDestSpill = true;
+          }
         }
-        if (auto *sourceLoad =
-                llvm::dyn_cast_or_null<LoadInst>(store->getValue())) {
-          if (sourceLoad->getName() != "cleanup_val" &&
-              sourceLoad->getName() != "old_val") {
-            if (sourceLoad->getBorrowKind() != BorrowKind::View) {
-              if (MIRValue *sourceAlloca =
-                      getBaseAlloca(sourceLoad->getPointer())) {
-                movedAllocas.insert(sourceAlloca);
+
+        if (!isDestSpill) {
+          if (auto *sourceLoad =
+                  llvm::dyn_cast_or_null<LoadInst>(store->getValue())) {
+            if (sourceLoad->getName() != "cleanup_val" &&
+                sourceLoad->getName() != "old_val") {
+              if (sourceLoad->getBorrowKind() != BorrowKind::View) {
+                if (MIRValue *sourceAlloca =
+                        getBaseAlloca(sourceLoad->getPointer())) {
+                  bool isEnv = sourceAlloca->getName().find("Env.lambda") !=
+                                   std::string::npos ||
+                               (sourceAlloca->getType() &&
+                                sourceAlloca->getType()->toString().find(
+                                    "Env.lambda") != std::string::npos);
+                  bool isTemp =
+                      !isEnv && (sourceAlloca->getName().find(".stack") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find(".temp") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find("temp.") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find(
+                                     "new.obj.stack") != std::string::npos);
+                  if (!isARCMaterial(sourceAlloca->getType()) || isTemp) {
+                    movedAllocas.insert(sourceAlloca);
+                  }
+                }
               }
             }
           }
@@ -258,7 +319,23 @@ bool DropElisionPass::runOnFunction(MIRFunction *F) {
               if (argLoad->getBorrowKind() != BorrowKind::View) {
                 if (MIRValue *sourceAlloca =
                         getBaseAlloca(argLoad->getPointer())) {
-                  movedAllocas.insert(sourceAlloca);
+                  bool isEnv = sourceAlloca->getName().find("Env.lambda") !=
+                                   std::string::npos ||
+                               (sourceAlloca->getType() &&
+                                sourceAlloca->getType()->toString().find(
+                                    "Env.lambda") != std::string::npos);
+                  bool isTemp =
+                      !isEnv && (sourceAlloca->getName().find(".stack") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find(".temp") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find("temp.") !=
+                                     std::string::npos ||
+                                 sourceAlloca->getName().find(
+                                     "new.obj.stack") != std::string::npos);
+                  if (!isARCMaterial(sourceAlloca->getType()) || isTemp) {
+                    movedAllocas.insert(sourceAlloca);
+                  }
                 }
               }
             }
@@ -268,12 +345,28 @@ bool DropElisionPass::runOnFunction(MIRFunction *F) {
         if (invoke->getCallee()) {
           std::string calleeName = invoke->getCallee()->getName();
           if (calleeName == "__moksha_free" ||
+              calleeName == "moksha_rt_map_free_internal" ||
+              calleeName == "moksha_rt_release_closure_env" ||
               calleeName.find(".destructor_ret_void") != std::string::npos ||
               calleeName.find(".drop_ret_void") != std::string::npos) {
             if (invoke->getArgs().size() > 0) {
               if (MIRValue *base = getBaseAlloca(invoke->getArgs()[0])) {
-                if (movedAllocas.count(base))
-                  elideInstruction = true;
+                bool isEnv =
+                    base->getName().find("Env.lambda") != std::string::npos ||
+                    (base->getType() && base->getType()->toString().find(
+                                            "Env.lambda") != std::string::npos);
+                bool isTemp =
+                    !isEnv &&
+                    (base->getName().find(".stack") != std::string::npos ||
+                     base->getName().find(".temp") != std::string::npos ||
+                     base->getName().find("temp.") != std::string::npos ||
+                     base->getName().find("new.obj.stack") !=
+                         std::string::npos);
+                if (!isARCMaterial(base->getType()) || isTemp) {
+                  if (movedAllocas.count(base)) {
+                    elideInstruction = true;
+                  }
+                }
               }
             }
           }
@@ -284,27 +377,47 @@ bool DropElisionPass::runOnFunction(MIRFunction *F) {
       if (auto *arc = llvm::dyn_cast_or_null<ARCInst>(inst)) {
         if (arc->getOpcode() == Opcode::Release) {
           if (MIRValue *base = getBaseAlloca(arc->getObject())) {
-            if (movedAllocas.count(base))
+            // Respect the ARC material check before stripping drops!
+            bool isEnv =
+                base->getName().find("Env.lambda") != std::string::npos ||
+                (base->getType() && base->getType()->toString().find(
+                                        "Env.lambda") != std::string::npos);
+            bool isTemp =
+                !isEnv &&
+                (base->getName().find(".stack") != std::string::npos ||
+                 base->getName().find(".temp") != std::string::npos ||
+                 base->getName().find("temp.") != std::string::npos ||
+                 base->getName().find("new.obj.stack") != std::string::npos);
+            if ((!isARCMaterial(base->getType()) || isTemp) &&
+                movedAllocas.count(base)) {
               elideInstruction = true;
+            }
           }
         }
       } else if (auto *call = llvm::dyn_cast_or_null<CallInst>(inst)) {
         if (call->getCallee()) {
           std::string calleeName = call->getCallee()->getName();
           if (calleeName == "__moksha_free" ||
+              calleeName == "moksha_rt_map_free_internal" ||
+              calleeName == "moksha_rt_release_closure_env" ||
               calleeName.find(".destructor_ret_void") != std::string::npos ||
               calleeName.find(".drop_ret_void") != std::string::npos) {
-
             if (call->getArgs().size() > 0) {
               if (MIRValue *base = getBaseAlloca(call->getArgs()[0])) {
-                if (base->getType()->toString().find("shared") ==
-                        std::string::npos &&
-                    base->getType()->toString().find("Arc<") ==
-                        std::string::npos) {
-
-                  if (movedAllocas.count(base)) {
-                    elideInstruction = true;
-                  }
+                bool isEnv =
+                    base->getName().find("Env.lambda") != std::string::npos ||
+                    (base->getType() && base->getType()->toString().find(
+                                            "Env.lambda") != std::string::npos);
+                bool isTemp =
+                    !isEnv &&
+                    (base->getName().find(".stack") != std::string::npos ||
+                     base->getName().find(".temp") != std::string::npos ||
+                     base->getName().find("temp.") != std::string::npos ||
+                     base->getName().find("new.obj.stack") !=
+                         std::string::npos);
+                if ((!isARCMaterial(base->getType()) || isTemp) &&
+                    movedAllocas.count(base)) {
+                  elideInstruction = true;
                 }
               }
             }

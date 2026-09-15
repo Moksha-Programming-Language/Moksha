@@ -1,0 +1,32 @@
+string g_telemetry_buffer = "Initial buffer state";
+
+class TelemetryPayload {
+    public string data;
+    constructor(string d) { this.data = d; }
+}
+
+void test_reassignment_leak() {
+    shared TelemetryPayload payload = new TelemetryPayload("Session A");
+    payload = new TelemetryPayload("Session B");
+}
+
+void test_closure_leak() {
+    string trace_id = "TX-9901";
+    any reporter = () => trace_id;
+}
+
+void test_map_reassignment_leak() {
+    table<string, string> active_flows = {"flow_1": "benign"};
+    active_flows["flow_1"] = "malicious";
+}
+
+println("--- [E2E] arc_leaks.mox ---");
+println("Running continuous ARC stress test. Check Task Manager...");
+
+// Infinite loop to rapidly trigger the allocations and potential leaks
+while (true) {
+    // g_telemetry_buffer = "Updated buffer state";
+    // test_reassignment_leak();
+    // test_map_reassignment_leak();
+    test_closure_leak();
+}

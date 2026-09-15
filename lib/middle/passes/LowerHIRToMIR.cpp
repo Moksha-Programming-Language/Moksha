@@ -100,8 +100,7 @@ public:
     bool isLargeStruct = false;
     auto kind = ty->getKind();
     if (kind == hir::TypeKind::Any || kind == hir::TypeKind::Slice ||
-        kind == hir::TypeKind::Closure || kind == hir::TypeKind::Map ||
-        kind == hir::TypeKind::Decimal) {
+        kind == hir::TypeKind::Closure || kind == hir::TypeKind::Decimal) {
       isLargeStruct = true;
     } else if (auto *st = llvm::dyn_cast_or_null<hir::StructType>(ty)) {
       auto getByteSize = [&](const hir::HIRType *t) -> size_t {
@@ -171,14 +170,11 @@ public:
   const hir::HIRType *resolveType(const hir::HIRType *t) {
     if (!t)
       return nullptr;
-
     t = stripMemoryModifiers(t);
-
     std::string tName = t->toString();
     if (currentTypeEnv.count(tName)) {
       const hir::HIRType *resolvedEnv =
           stripMemoryModifiers(currentTypeEnv[tName]);
-      ensureStringifierForAny(resolvedEnv);
       return resolvedEnv;
     }
 
@@ -187,21 +183,18 @@ public:
       const hir::HIRType *resolved = resolveType(ptrTy->getPointee());
       auto *res = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
           resolved, hir::Ownership::None);
-      ensureStringifierForAny(res);
       return res;
     }
     if (auto *refTy = llvm::dyn_cast_or_null<hir::ReferenceType>(t)) {
       const hir::HIRType *resolved = resolveType(refTy->getInner());
       auto *res = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
           resolved, hir::Ownership::None);
-      ensureStringifierForAny(res);
       return res;
     }
-
-    ensureStringifierForAny(t);
     return t;
   }
 
+  // Strip memory modifiers from a type, e.g. `mut T` becomes `T`
   const hir::HIRType *stripMemoryModifiers(const hir::HIRType *ty) const {
     if (!ty)
       return nullptr;
@@ -248,9 +241,747 @@ public:
     return coreTy;
   }
 
+  // Create an alloca for hoisted memory, e.g. for a freshly allocated value
+  MIRValue *createHoistedAlloca(const hir::HIRType *allocatedType,
+                                const std::string &name, SourceLocation loc) {
+    auto *ptrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        allocatedType, hir::Ownership::None);
+    auto allocaInst =
+        std::make_unique<AllocaInst>(ptrTy, allocatedType, name, loc, 0);
+    MIRValue *allocaPtr = allocaInst.get();
+
+    currFunc->getEntryBlock()->getInstructionsMut().insert(
+        currFunc->getEntryBlock()->getInstructionsMut().begin(),
+        std::move(allocaInst));
+
+    return allocaPtr;
+  }
+
+  // Set the tracked expression value, accounting for memory modifiers
+  void setTrackedExprValue(MIRValue *val, SourceLocation loc) {
+    if (!val || isLValueContext) {
+      lastExprValue = val;
+      return;
+    }
+
+    const hir::HIRType *finalTy = val->getType();
+    const hir::HIRType *checkTy = stripMemoryModifiers(finalTy);
+
+    bool typeIsARC = false;
+    while (checkTy) {
+      if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+        if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+            ptrTy->getOwnership() == hir::Ownership::Owned ||
+            ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+        checkTy = stripMemoryModifiers(ptrTy->getPointee());
+      } else if (auto *refTy =
+                     llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+        if (refTy->getOwnership() == hir::Ownership::Shared ||
+            refTy->getOwnership() == hir::Ownership::Owned ||
+            refTy->getInner()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+        checkTy = stripMemoryModifiers(refTy->getInner());
+      } else if (auto *nullTy =
+                     llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+        checkTy = stripMemoryModifiers(nullTy->getInner());
+      } else {
+        break;
+      }
+    }
+
+    if (checkTy) {
+      auto kind = checkTy->getKind();
+      if (kind == hir::TypeKind::String || kind == hir::TypeKind::Slice ||
+          kind == hir::TypeKind::Map || kind == hir::TypeKind::Closure ||
+          kind == hir::TypeKind::Any || kind == hir::TypeKind::Promise ||
+          checkTy->toString().find("Arc<") != std::string::npos ||
+          checkTy->toString().find("Box<") != std::string::npos ||
+          checkTy->toString().find("closure") != std::string::npos) {
+        typeIsARC = true;
+      }
+      if (checkTy->toString().find("Closure.lambda.") != std::string::npos) {
+        typeIsARC = false;
+      }
+      if (!typeIsARC) {
+        std::string className = checkTy->toString();
+        while (!className.empty() &&
+               (className[0] == '*' || className[0] == '&' ||
+                className[0] == ' ' || className[0] == '?'))
+          className = className.substr(1);
+        if (className.find("struct.") == 0)
+          className = className.substr(7);
+        if (className.find("class.") == 0)
+          className = className.substr(6);
+        for (const auto *cls : hirModule->getClasses()) {
+          if (cls->getName() == className ||
+              className.find(cls->getName() + "<") == 0) {
+            bool isRef = false;
+            const hir::HIRType *clsTy = cls->getType();
+            if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(clsTy)) {
+              isRef = true;
+              clsTy = pTy->getPointee();
+            } else if (auto *rTy =
+                           llvm::dyn_cast_or_null<hir::ReferenceType>(clsTy)) {
+              isRef = true;
+              clsTy = rTy->getInner();
+            }
+            if (auto *st = llvm::dyn_cast_or_null<hir::StructType>(clsTy)) {
+              if (st->isRefClass())
+                isRef = true;
+            }
+            if (isRef || cls->hasVTable())
+              typeIsARC = true;
+            break;
+          }
+        }
+      }
+    }
+
+    bool isClosureStruct =
+        checkTy &&
+        checkTy->toString().find("Closure.lambda.") != std::string::npos;
+    bool isAnyType = checkTy && checkTy->getKind() == hir::TypeKind::Any;
+
+    if ((typeIsARC || isClosureStruct || isAnyType) &&
+        val->getBorrowKind() != mir::BorrowKind::View &&
+        !llvm::isa<LoadInst>(val)) {
+
+      auto *ptrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+          finalTy, hir::Ownership::None);
+
+      auto allocaInst = std::make_unique<AllocaInst>(ptrTy, finalTy,
+                                                     "temp.arc.alloca", loc, 0);
+      MIRValue *tempAlloca = allocaInst.get();
+      MIRBlock *entryBlock = currFunc->getEntryBlock();
+
+      auto *nullVal = mirModule->getOrInsertConstant<ConstantNull>(finalTy);
+      entryBlock->getInstructionsMut().insert(
+          entryBlock->getInstructionsMut().begin(), std::move(allocaInst));
+
+      auto storeNull = std::make_unique<StoreInst>(nullVal, tempAlloca, loc);
+      entryBlock->getInstructionsMut().insert(
+          entryBlock->getInstructionsMut().begin() + 1, std::move(storeNull));
+
+      bool isFreshOwned = false;
+      MIRValue *traceVal = val;
+
+      // Strip outer casts
+      while (auto *cast = llvm::dyn_cast_or_null<CastInst>(traceVal)) {
+        traceVal = cast->getValue();
+      }
+
+      // Strip ABI Load wrappers for built-ins that return void* pointers
+      if (auto *loadInst = llvm::dyn_cast_or_null<LoadInst>(traceVal)) {
+        traceVal = loadInst->getPointer();
+        while (auto *cast = llvm::dyn_cast_or_null<CastInst>(traceVal)) {
+          traceVal = cast->getValue();
+        }
+      }
+
+      // Evaluate ownership
+      if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(traceVal)) {
+        isFreshOwned = callInst->returnsOwned();
+        if (!isFreshOwned && callInst->getCallee()) {
+          std::string cName = callInst->getCallee()->getName();
+          if (cName.find("__moksha_") == 0 ||
+              cName.find("moksha_rt_array_alloc") == 0 ||
+              cName.find("moksha_rt_array_clone") == 0 ||
+              cName.find("moksha_rt_array_slice") == 0 ||
+              cName.find("moksha_rt_array_remove") == 0 ||
+              cName.find("moksha_rt_array_pop") == 0 ||
+              cName.find("moksha_string_") == 0 ||
+              cName.find("moksha_file_open") == 0 ||
+              cName.find("moksha_file_read") == 0 ||
+              cName.find("moksha_rt_map_new") == 0) {
+            isFreshOwned = true;
+          }
+        }
+      } else if (auto *invInst = llvm::dyn_cast_or_null<InvokeInst>(traceVal)) {
+        isFreshOwned = invInst->returnsOwned();
+        if (!isFreshOwned && invInst->getCallee()) {
+          std::string cName = invInst->getCallee()->getName();
+          if (cName.find("__moksha_") == 0 ||
+              cName.find("moksha_rt_array_alloc") == 0 ||
+              cName.find("moksha_rt_array_clone") == 0 ||
+              cName.find("moksha_rt_array_slice") == 0 ||
+              cName.find("moksha_rt_array_remove") == 0 ||
+              cName.find("moksha_rt_array_pop") == 0 ||
+              cName.find("moksha_string_") == 0 ||
+              cName.find("moksha_file_open") == 0 ||
+              cName.find("moksha_file_read") == 0 ||
+              cName.find("moksha_rt_map_new") == 0) {
+            isFreshOwned = true;
+          }
+        }
+      } else if (llvm::isa<MakeClosureInst>(traceVal)) {
+        isFreshOwned = true;
+      }
+
+      // Store the value to the alloca immediately
+      builder->insert(std::make_unique<StoreInst>(val, tempAlloca, loc));
+
+      // Delegate to emitDeepRetain which correctly unpacks Any/Slice/Struct
+      // pointers
+      if (!isFreshOwned) {
+        emitDeepRetain(tempAlloca, finalTy, false, loc);
+      }
+
+      if (!scopeStack.empty()) {
+        if (isClosureStruct) {
+          scopeStack.back().ownedVars.push_back(tempAlloca);
+        } else {
+          scopeStack.back().refCountedVars.push_back(tempAlloca);
+        }
+      }
+
+      lastExprValue = builder->insert(
+          std::make_unique<LoadInst>(tempAlloca, "temp.safe.load", loc));
+      lastExprValue->setBorrowKind(mir::BorrowKind::View);
+    } else {
+      lastExprValue = val;
+    }
+  }
+
+  // Emit an explicit AnyBox for a value
+  MIRValue *emitExplicitAnyBox(MIRValue *val, const hir::HIRType *valTy,
+                               SourceLocation loc, bool isFresh = false) {
+    auto *anyTy = const_cast<hir::HIRModule *>(hirModule)->getAnyType();
+    auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+    auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        voidTy, hir::Ownership::None);
+    auto *i32Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+    auto *i64Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(64, true);
+
+    uint32_t typeId = 19;
+    const hir::HIRType *coreTy = stripMemoryModifiers(valTy);
+    if (isFresh) {
+      if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(coreTy))
+        coreTy = stripMemoryModifiers(pTy->getPointee());
+      if (auto *nTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(coreTy))
+        coreTy = stripMemoryModifiers(nTy->getInner());
+    } else {
+      if (auto *nTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(coreTy))
+        coreTy = stripMemoryModifiers(nTy->getInner());
+    }
+
+    if (coreTy->getKind() == hir::TypeKind::Bool)
+      typeId = 0;
+    else if (coreTy->getKind() == hir::TypeKind::Int) {
+      auto *intTy = static_cast<const hir::HIRIntType *>(coreTy);
+      if (intTy->getWidth() == 32)
+        typeId = intTy->isSigned() ? 5 : 6;
+      else if (intTy->getWidth() == 64)
+        typeId = intTy->isSigned() ? 7 : 8;
+      else if (intTy->getWidth() == 8)
+        typeId = intTy->isSigned() ? 1 : 2;
+      else if (intTy->getWidth() == 16)
+        typeId = intTy->isSigned() ? 3 : 4;
+    } else if (coreTy->getKind() == hir::TypeKind::Float) {
+      auto *fltTy = static_cast<const hir::HIRFloatType *>(coreTy);
+      typeId = (fltTy->getWidth() == 64) ? 14 : 13;
+    } else if (coreTy->getKind() == hir::TypeKind::Decimal) {
+      typeId = 15;
+    } else if (coreTy->getKind() == hir::TypeKind::String)
+      typeId = 16;
+    else if (coreTy->getKind() == hir::TypeKind::Map)
+      typeId = 17;
+    else if (coreTy->getKind() == hir::TypeKind::Slice)
+      typeId = 18;
+    else if (coreTy->getKind() == hir::TypeKind::Array)
+      typeId = 19;
+    else if (coreTy->getKind() == hir::TypeKind::Closure)
+      typeId = 21;
+    else if (coreTy->getKind() == hir::TypeKind::Promise)
+      typeId = 20;
+
+    ensureStringifierForAny(valTy);
+    std::string tyStr = coreTy->toString();
+    tyStr.erase(std::remove(tyStr.begin(), tyStr.end(), '?'), tyStr.end());
+    std::string strFuncName = "__moksha_ptr_to_string";
+
+    if (coreTy->getKind() == hir::TypeKind::Pointer ||
+        coreTy->getKind() == hir::TypeKind::Reference ||
+        coreTy->getKind() == hir::TypeKind::Null) {
+      strFuncName = "__moksha_ptr_to_string";
+      typeId = 19;
+    } else if (coreTy->getKind() == hir::TypeKind::Map) {
+      std::string tName = tyStr;
+      for (char &c : tName)
+        if (!isalnum(c))
+          c = '_';
+      strFuncName = "__moksha_map_to_string_" + tName;
+    } else if (coreTy->getKind() == hir::TypeKind::Array ||
+               coreTy->getKind() == hir::TypeKind::Slice) {
+      std::string tName = tyStr;
+      for (char &c : tName)
+        if (!isalnum(c))
+          c = '_';
+      strFuncName = "__moksha_array_to_string_" + tName;
+    } else if (coreTy->getKind() == hir::TypeKind::String) {
+      strFuncName = "__moksha_cstr_to_string";
+    } else if (coreTy->getKind() == hir::TypeKind::Int) {
+      auto *intTy = static_cast<const hir::HIRIntType *>(coreTy);
+      if (intTy->getWidth() == 32)
+        strFuncName = intTy->isSigned() ? "__moksha_int_to_string"
+                                        : "__moksha_uint_to_string";
+      else if (intTy->getWidth() == 64)
+        strFuncName = intTy->isSigned() ? "__moksha_long_to_string"
+                                        : "__moksha_ulong_to_string";
+      else if (intTy->getWidth() == 8)
+        strFuncName = intTy->isSigned() ? "__moksha_char_to_string"
+                                        : "__moksha_uchar_to_string";
+      else if (intTy->getWidth() == 16)
+        strFuncName = intTy->isSigned() ? "__moksha_short_to_string"
+                                        : "__moksha_ushort_to_string";
+    } else if (coreTy->getKind() == hir::TypeKind::Float) {
+      auto *fltTy = static_cast<const hir::HIRFloatType *>(coreTy);
+      if (fltTy->getWidth() == 64)
+        strFuncName = "__moksha_double_to_string";
+      else
+        strFuncName = "__moksha_float_to_string";
+    } else if (coreTy->getKind() == hir::TypeKind::Bool) {
+      strFuncName = "__moksha_bool_to_string";
+    } else if (coreTy->getKind() == hir::TypeKind::Decimal) {
+      strFuncName = "moksha_rt_dec_to_string";
+    } else if (coreTy->getKind() == hir::TypeKind::Null) {
+      strFuncName = "__moksha_null_to_string";
+    }
+
+    ensureBuiltinMIR(strFuncName);
+    MIRFunction *strFunc = mirModule->getFunction(strFuncName);
+    if (!strFunc) {
+      auto fn = std::make_unique<MIRFunction>(
+          const_cast<hir::HIRModule *>(hirModule)->getStringType(), strFuncName,
+          Linkage::External);
+      fn->addArgument(std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+      strFunc = fn.get();
+      mirModule->addFunction(std::move(fn));
+    }
+
+    std::string dtorName = "";
+    if (coreTy->getKind() == hir::TypeKind::Map) {
+      dtorName = getOrCreateMapDestructor(coreTy)->getName();
+    } else if (coreTy->getKind() == hir::TypeKind::Array ||
+               coreTy->getKind() == hir::TypeKind::Slice) {
+      dtorName = getOrCreateArrayDestructor(coreTy)->getName();
+    } else if (coreTy->getKind() == hir::TypeKind::Closure ||
+               coreTy->toString().find("closure") != std::string::npos ||
+               coreTy->toString().find("Closure.") != std::string::npos) {
+      dtorName = "moksha_rt_release_closure_env";
+    } else if (coreTy->getKind() == hir::TypeKind::String ||
+               coreTy->getKind() == hir::TypeKind::Promise ||
+               coreTy->getKind() == hir::TypeKind::Any ||
+               coreTy->toString().find("Arc<") != std::string::npos ||
+               coreTy->toString().find("Box<") != std::string::npos) {
+      dtorName = "";
+    } else if (coreTy->getKind() == hir::TypeKind::Struct) {
+      std::string fName = coreTy->toString();
+      while (!fName.empty() && (fName[0] == '&' || fName[0] == '*' ||
+                                fName[0] == ' ' || fName[0] == '?'))
+        fName = fName.substr(1);
+      size_t arcPos = fName.find("Arc<");
+      if (arcPos != std::string::npos) {
+        fName = fName.substr(arcPos + 4);
+        size_t endPos = fName.rfind(">");
+        if (endPos != std::string::npos)
+          fName = fName.substr(0, endPos);
+      }
+      dtorName = fName + ".destructor_ret_void";
+    }
+
+    MIRFunction *dtorFunc = nullptr;
+    if (!dtorName.empty()) {
+      ensureBuiltinMIR(dtorName);
+      dtorFunc = mirModule->getFunction(dtorName);
+      if (!dtorFunc) {
+        auto fn =
+            std::make_unique<MIRFunction>(voidTy, dtorName, Linkage::External);
+        fn->addArgument(std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+        dtorFunc = fn.get();
+        mirModule->addFunction(std::move(fn));
+      }
+    }
+
+    ensureBuiltinMIR("moksha_rt_retain");
+    MIRFunction *retainFunc = mirModule->getFunction("moksha_rt_retain");
+    if (!retainFunc) {
+      auto fn = std::make_unique<MIRFunction>(voidTy, "moksha_rt_retain",
+                                              Linkage::External);
+      fn->addArgument(std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+      retainFunc = fn.get();
+      mirModule->addFunction(std::move(fn));
+    }
+
+    std::string safeTyStr = coreTy->toString();
+    for (char &c : safeTyStr)
+      if (!isalnum(c))
+        c = '_';
+    std::string vtableName = "__moksha_any_vtable_" + safeTyStr;
+
+    auto *vtableStructTy =
+        const_cast<hir::HIRModule *>(hirModule)->getStructType(
+            vtableName + "_struct_ty",
+            {i32Ty, voidPtrTy, voidPtrTy, voidPtrTy});
+
+    MIRGlobal *vtableGlobal = mirModule->getGlobal(vtableName);
+    if (!vtableGlobal) {
+      MIRValue *idConst =
+          mirModule->getOrInsertConstant<ConstantInt>(typeId, i32Ty);
+      MIRValue *strCast;
+      if (strFunc)
+        strCast = static_cast<MIRValue *>(
+            mirModule->getOrInsertConstant<ConstantBitCast>(strFunc,
+                                                            voidPtrTy));
+      else
+        strCast = static_cast<MIRValue *>(
+            mirModule->getOrInsertConstant<ConstantNull>(voidPtrTy));
+      MIRValue *retainCast;
+      if (retainFunc)
+        retainCast = static_cast<MIRValue *>(
+            mirModule->getOrInsertConstant<ConstantBitCast>(retainFunc,
+                                                            voidPtrTy));
+      else
+        retainCast = static_cast<MIRValue *>(
+            mirModule->getOrInsertConstant<ConstantNull>(voidPtrTy));
+
+      MIRValue *dropCast;
+      if (dtorFunc)
+        dropCast = static_cast<MIRValue *>(
+            mirModule->getOrInsertConstant<ConstantBitCast>(dtorFunc,
+                                                            voidPtrTy));
+      else
+        dropCast = static_cast<MIRValue *>(
+            mirModule->getOrInsertConstant<ConstantNull>(voidPtrTy));
+
+      auto *vtableConst = mirModule->getOrInsertConstant<ConstantStruct>(
+          vtableStructTy,
+          std::vector<MIRValue *>{idConst, strCast, retainCast, dropCast});
+      vtableGlobal =
+          builder->createGlobal(mirModule.get(), vtableName, vtableStructTy,
+                                vtableConst, true, Linkage::Internal);
+    }
+
+    // STACK ALLOCATE THE BOX ITSELF
+    auto *anyLayoutTy = const_cast<hir::HIRModule *>(hirModule)->getStructType(
+        "__moksha_any_layout", {voidPtrTy, voidPtrTy});
+    auto *anyAlloca = builder->createAlloca(anyTy, "any.box.stack", loc);
+    auto *anyLayoutPtrTy =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            anyLayoutTy, hir::Ownership::None);
+    MIRValue *layoutPtr = builder->createBitCast(anyAlloca, anyLayoutPtrTy,
+                                                 "any.layout.cast", loc);
+
+    // HEAP ALLOCATE THE PAYLOAD IF IT IS A VALUE TYPE
+    MIRValue *voidPayloadPtr = val;
+    bool isNativePtr = (valTy->getKind() == hir::TypeKind::Pointer ||
+                        valTy->getKind() == hir::TypeKind::Reference ||
+                        valTy->getKind() == hir::TypeKind::Null ||
+                        coreTy->getKind() == hir::TypeKind::Pointer ||
+                        coreTy->getKind() == hir::TypeKind::Reference ||
+                        coreTy->getKind() == hir::TypeKind::String ||
+                        coreTy->getKind() == hir::TypeKind::Map ||
+                        coreTy->getKind() == hir::TypeKind::Slice ||
+                        coreTy->getKind() == hir::TypeKind::Array ||
+                        coreTy->getKind() == hir::TypeKind::Closure ||
+                        coreTy->getKind() == hir::TypeKind::Promise ||
+                        coreTy->getKind() == hir::TypeKind::Any ||
+                        coreTy->getKind() == hir::TypeKind::Struct);
+
+    if (!isNativePtr && !isFresh) {
+      ensureBuiltinMIR("__moksha_alloc");
+      MIRFunction *allocFunc = mirModule->getFunction("__moksha_alloc");
+      if (!allocFunc) {
+        auto fn = std::make_unique<MIRFunction>(voidPtrTy, "__moksha_alloc",
+                                                Linkage::External);
+        fn->addArgument(std::make_unique<MIRArgument>(fn.get(), i64Ty, 0));
+        fn->addArgument(std::make_unique<MIRArgument>(fn.get(), i32Ty, 1));
+        allocFunc = fn.get();
+        mirModule->addFunction(std::move(fn));
+      }
+
+      auto *nullPtr = mirModule->getOrInsertConstant<ConstantNull>(
+          const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+              val->getType(), hir::Ownership::None));
+      auto *oneConst = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+      auto *sizeGep = builder->createGEP(nullPtr, {oneConst}, val->getType(),
+                                         "sizeof.gep", loc);
+      MIRValue *sizeVal = builder->insert(std::make_unique<CastInst>(
+          Opcode::PtrToInt, sizeGep, i64Ty, "sizeof.i64", loc));
+      MIRValue *typeIdValConst =
+          mirModule->getOrInsertConstant<ConstantInt>(typeId, i32Ty);
+
+      MIRValue *payloadHeapPtr =
+          builder->createCall(allocFunc, {sizeVal, typeIdValConst}, voidPtrTy,
+                              "any.payload.heap", false, loc);
+      auto *typedHeapPtr = builder->createBitCast(
+          payloadHeapPtr,
+          const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+              val->getType(), hir::Ownership::None),
+          "any.payload.typed", loc);
+      builder->insert(std::make_unique<StoreInst>(val, typedHeapPtr, loc));
+      voidPayloadPtr = payloadHeapPtr;
+    } else {
+      if (voidPayloadPtr->getType() != voidPtrTy) {
+        voidPayloadPtr = builder->createBitCast(voidPayloadPtr, voidPtrTy,
+                                                "payload.void.ptr", loc);
+      }
+    }
+
+    bool typeIsARC = false;
+    const hir::HIRType *checkTy = stripMemoryModifiers(valTy);
+    if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+      if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+          ptrTy->getOwnership() == hir::Ownership::Owned ||
+          ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+        typeIsARC = true;
+      }
+      checkTy = stripMemoryModifiers(ptrTy->getPointee());
+    } else if (auto *refTy =
+                   llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+      if (refTy->getOwnership() == hir::Ownership::Shared ||
+          refTy->getOwnership() == hir::Ownership::Owned ||
+          refTy->getInner()->getKind() == hir::TypeKind::Any) {
+        typeIsARC = true;
+      }
+      checkTy = stripMemoryModifiers(refTy->getInner());
+    }
+
+    if (auto *nullTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+      checkTy = stripMemoryModifiers(nullTy->getInner());
+    }
+    if (checkTy) {
+      auto k = checkTy->getKind();
+      if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+          k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+          k == hir::TypeKind::Any || k == hir::TypeKind::Promise ||
+          checkTy->toString().find("Arc<") != std::string::npos ||
+          checkTy->toString().find("Box<") != std::string::npos ||
+          checkTy->toString().find("closure") != std::string::npos) {
+        typeIsARC = true;
+      }
+    }
+    if (valTy &&
+        valTy->toString().find("Closure.lambda.") != std::string::npos) {
+      typeIsARC = false;
+    }
+
+    if (typeIsARC && !isFresh) {
+      builder->insert(
+          std::make_unique<ARCInst>(Opcode::Retain, val, nullptr, loc));
+    }
+
+    auto *zero = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+    auto *one = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+    auto *voidPtrPtrTy =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            voidPtrTy, hir::Ownership::None);
+
+    MIRValue *dataGep = builder->createGEP(layoutPtr, {zero, zero}, anyLayoutTy,
+                                           "any.data.gep", loc);
+    MIRValue *dataGepCast =
+        builder->createBitCast(dataGep, voidPtrPtrTy, "any.data.gep.cast", loc);
+    builder->insert(
+        std::make_unique<StoreInst>(voidPayloadPtr, dataGepCast, loc));
+
+    MIRValue *vtableGep = builder->createGEP(
+        layoutPtr, {zero, one}, anyLayoutTy, "any.vtable.gep", loc);
+    MIRValue *vtableGepCast = builder->createBitCast(
+        vtableGep, voidPtrPtrTy, "any.vtable.gep.cast", loc);
+    MIRValue *vtablePtrCast =
+        builder->createBitCast(vtableGlobal, voidPtrTy, "vtable.cast", loc);
+    builder->insert(
+        std::make_unique<StoreInst>(vtablePtrCast, vtableGepCast, loc));
+    if (!scopeStack.empty()) {
+      scopeStack.back().refCountedVars.push_back(anyAlloca);
+    }
+    auto *anyPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        anyTy, hir::Ownership::None);
+    MIRValue *anyFinalPtr =
+        builder->createBitCast(anyAlloca, anyPtrTy, "any.final.ptr", loc);
+    MIRValue *loadedAny = builder->insert(
+        std::make_unique<LoadInst>(anyFinalPtr, "any.val.load", loc));
+    loadedAny->setBorrowKind(mir::BorrowKind::View);
+    return loadedAny;
+  }
+
+  // Evaluate an expression as an L-value
   MIRValue *evaluateAsLValue(const hir::HIRExpr *expr) {
     if (!expr)
       return nullptr;
+
+    // Peel back AST wrappers to find the underlying expression
+    const hir::HIRExpr *coreExpr = expr;
+    while (coreExpr) {
+      if (auto *addr =
+              llvm::dyn_cast_or_null<hir::HIRAddressOfExpr>(coreExpr)) {
+        coreExpr = addr->getOperand();
+      } else if (auto *shared =
+                     llvm::dyn_cast_or_null<hir::HIRSharedExpr>(coreExpr)) {
+        coreExpr = shared->getExpr();
+      } else if (auto *cast =
+                     llvm::dyn_cast_or_null<hir::HIRCastExpr>(coreExpr)) {
+        coreExpr = cast->getExpr();
+      } else {
+        break;
+      }
+    }
+
+    // Direct Map L-Value Indexing
+    if (auto *idxExpr = llvm::dyn_cast_or_null<hir::HIRIndexExpr>(coreExpr)) {
+      const hir::HIRType *baseTy =
+          stripMemoryModifiers(idxExpr->getBase()->getType());
+      if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(baseTy)) {
+        baseTy = stripMemoryModifiers(ptrTy->getPointee());
+      }
+
+      if (baseTy && baseTy->getKind() == hir::TypeKind::Map) {
+        auto *mapTy = static_cast<const hir::HIRMapType *>(baseTy);
+        auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+        auto *voidPtrTy =
+            const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                voidTy, hir::Ownership::None);
+        auto *anyTy = const_cast<hir::HIRModule *>(hirModule)->getAnyType();
+        auto *anyPtrTy =
+            const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                anyTy, hir::Ownership::None);
+        auto *i64Ty =
+            const_cast<hir::HIRModule *>(hirModule)->getIntType(64, true);
+        auto *i32Ty =
+            const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+
+        std::string getOrCreateName = "moksha_rt_map_get_or_create";
+        ensureBuiltinMIR(getOrCreateName);
+        MIRFunction *getOrCreateFunc = mirModule->getFunction(getOrCreateName);
+        if (!getOrCreateFunc) {
+          auto fn = std::make_unique<MIRFunction>(voidPtrTy, getOrCreateName,
+                                                  Linkage::External);
+          fn->addArgument(
+              std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+          fn->addArgument(std::make_unique<MIRArgument>(fn.get(), anyPtrTy, 1));
+          fn->addArgument(std::make_unique<MIRArgument>(fn.get(), i64Ty, 2));
+          fn->addArgument(std::make_unique<MIRArgument>(fn.get(), i32Ty, 3));
+          getOrCreateFunc = fn.get();
+          mirModule->addFunction(std::move(fn));
+        }
+
+        MIRValue *mapBase = evaluateAsLValue(idxExpr->getBase());
+        if (mapBase &&
+            mapBase->getType()->getKind() == hir::TypeKind::Pointer) {
+          mapBase =
+              builder->createLoad(mapBase, "map.base.load", expr->getLoc());
+        }
+        MIRValue *mapPtr = builder->createBitCast(
+            mapBase, voidPtrTy, "map.ptr.cast", expr->getLoc());
+
+        // Prepare Key
+        visit(idxExpr->getIndex());
+        MIRValue *keyVal = lastExprValue;
+
+        bool typeIsARC = false;
+        const hir::HIRType *checkTy = stripMemoryModifiers(keyVal->getType());
+        if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+          if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+              ptrTy->getOwnership() == hir::Ownership::Owned ||
+              ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+            typeIsARC = true;
+          }
+        } else if (auto *refTy =
+                       llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+          if (refTy->getOwnership() == hir::Ownership::Shared ||
+              refTy->getOwnership() == hir::Ownership::Owned ||
+              refTy->getInner()->getKind() == hir::TypeKind::Any) {
+            typeIsARC = true;
+          }
+        } else {
+          if (auto *nullTy =
+                  llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+            checkTy = stripMemoryModifiers(nullTy->getInner());
+          }
+          if (checkTy) {
+            auto k = checkTy->getKind();
+            if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+                k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+                k == hir::TypeKind::Any || k == hir::TypeKind::Promise ||
+                checkTy->toString().find("Arc<") != std::string::npos ||
+                checkTy->toString().find("Box<") != std::string::npos) {
+              typeIsARC = true;
+            }
+          }
+        }
+        if (typeIsARC && !llvm::isa<ConstantNull>(keyVal)) {
+          builder->insert(std::make_unique<ARCInst>(Opcode::Retain, keyVal,
+                                                    nullptr, expr->getLoc()));
+        }
+
+        MIRValue *keyPtr = nullptr;
+        if (keyVal->getType()->getKind() != hir::TypeKind::Any) {
+          keyPtr = boxValue(keyVal, keyVal->getType(), anyTy, expr->getLoc());
+        } else {
+          if (keyVal->getType() == anyTy) {
+            auto *keySpill = createHoistedAlloca(anyTy, "map.key.lval.spill",
+                                                 expr->getLoc());
+            builder->insert(
+                std::make_unique<StoreInst>(keyVal, keySpill, expr->getLoc()));
+            keyPtr = keySpill;
+          } else {
+            keyPtr = keyVal;
+          }
+        }
+
+        if (keyPtr->getType() != anyPtrTy) {
+          keyPtr = builder->createBitCast(keyPtr, anyPtrTy, "map.key.ptr",
+                                          expr->getLoc());
+        }
+
+        // Calculate Value Size
+        const hir::HIRType *valElemTy = mapTy->getValueType();
+        auto *nullValPtr = mirModule->getOrInsertConstant<ConstantNull>(
+            const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                valElemTy, hir::Ownership::None));
+        auto *one = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+        auto *sizeGep = builder->createGEP(nullValPtr, {one}, valElemTy,
+                                           "val.sizeof.gep", expr->getLoc());
+        MIRValue *sizeVal = builder->insert(
+            std::make_unique<CastInst>(Opcode::PtrToInt, sizeGep, i64Ty,
+                                       "val.sizeof.i64", expr->getLoc()));
+        MIRValue *typeIdVal =
+            mirModule->getOrInsertConstant<ConstantInt>(19, i32Ty);
+
+        MIRValue *rawValPtr = builder->createCall(
+            getOrCreateFunc, {mapPtr, keyPtr, sizeVal, typeIdVal}, voidPtrTy,
+            "map.val.raw_ptr", false, expr->getLoc());
+
+        bool isNativePtr = valElemTy->getKind() == hir::TypeKind::Pointer ||
+                           valElemTy->getKind() == hir::TypeKind::Reference ||
+                           valElemTy->getKind() == hir::TypeKind::String ||
+                           valElemTy->getKind() == hir::TypeKind::Map ||
+                           valElemTy->getKind() == hir::TypeKind::Slice ||
+                           valElemTy->getKind() == hir::TypeKind::Array ||
+                           valElemTy->getKind() == hir::TypeKind::Closure ||
+                           valElemTy->getKind() == hir::TypeKind::Promise ||
+                           valElemTy->getKind() == hir::TypeKind::Any ||
+                           valElemTy->getKind() == hir::TypeKind::Struct;
+
+        if (isNativePtr) {
+          auto *spill =
+              createHoistedAlloca(valElemTy, "map.lval.spill", expr->getLoc());
+          auto *castRaw = builder->createBitCast(
+              rawValPtr, valElemTy, "map.val.cast", expr->getLoc());
+          builder->insert(
+              std::make_unique<StoreInst>(castRaw, spill, expr->getLoc()));
+          return spill;
+        } else {
+          auto *targetPtrTy =
+              const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                  valElemTy, hir::Ownership::Borrowed);
+          return builder->createBitCast(rawValPtr, targetPtrTy, "map.val.ref",
+                                        expr->getLoc());
+        }
+      }
+    }
 
     bool oldLValueContext = isLValueContext;
     isLValueContext = true;
@@ -290,6 +1021,7 @@ public:
     return val;
   }
 
+  // Mangle a function name based on its types
   std::string mangleName(const std::string &base,
                          const std::vector<const hir::HIRType *> &types) {
     std::string res = base;
@@ -749,13 +1481,23 @@ public:
     scopeStack[scopeIdx].ownedVars.clear();
     scopeStack[scopeIdx].refCountedVars.clear();
 
-    // 1. Run Deferred Statements & Lock Cleanups (LIFO)
+    MIRInst *termRaw = getTerminator(builder->getInsertBlock());
+    std::unique_ptr<MIRInst> savedTerm;
+    if (termRaw) {
+      savedTerm =
+          std::move(builder->getInsertBlock()->getInstructionsMut().back());
+      builder->getInsertBlock()->getInstructionsMut().pop_back();
+    }
+
+    // Run Deferred Statements & Lock Cleanups (LIFO)
     for (auto it = defersToProcess.rbegin(); it != defersToProcess.rend();
          ++it) {
       const hir::HIRStmt *deferred = *it;
 
       if (getTerminator(builder->getInsertBlock()))
         continue;
+
+      scopeStack.push_back({});
 
       // Ensure locks are released during stack unwinding or early returns
       if (auto *lockStmt = llvm::dyn_cast_or_null<hir::LockStmt>(deferred)) {
@@ -833,14 +1575,16 @@ public:
         // Standard deferred statement
         visit(deferred);
       }
+
+      if (!getTerminator(builder->getInsertBlock())) {
+        emitScopeCleanup(scopeStack.size() - 1, loc, false);
+      }
+      scopeStack.pop_back();
     }
 
     // Helper to process both Owned and Shared drops
     auto processDrops = [&](std::vector<MIRValue *> &vars, bool isARC) {
       for (auto it = vars.rbegin(); it != vars.rend(); ++it) {
-        if (getTerminator(builder->getInsertBlock()))
-          continue;
-
         MIRValue *allocaPtr = *it;
 
         SourceLocation dropLoc;
@@ -854,16 +1598,40 @@ public:
           valTy = pTy->getPointee();
         }
 
+        if (valTy && isWeakMemory(valTy)) {
+          MIRValue *nullVal =
+              mirModule->getOrInsertConstant<ConstantNull>(valTy);
+          builder->createStoreWeak(nullVal, allocaPtr, dropLoc);
+          continue;
+        }
+
         if (valTy) {
           std::string typeName = valTy->toString();
 
-          // Clean up pointer/smart pointer prefixes for destructor lookup
-          if (typeName.find("shared ") == 0)
+          auto removePrefix = [&](const std::string &prefix) {
+            if (typeName.find(prefix) == 0)
+              typeName = typeName.substr(prefix.length());
+          };
+
+          while (!typeName.empty() &&
+                 (typeName[0] == '&' || typeName[0] == '*' ||
+                  typeName[0] == ' ' || typeName[0] == '?')) {
+            typeName = typeName.substr(1);
+          }
+
+          if (typeName.find("struct.") == 0)
             typeName = typeName.substr(7);
-          if (typeName.find("owned ") == 0)
+          if (typeName.find("class.") == 0)
             typeName = typeName.substr(6);
-          if (typeName.find("weak ") == 0)
-            typeName = typeName.substr(5);
+
+          removePrefix("shared ");
+          removePrefix("owned ");
+          removePrefix("weak ");
+          removePrefix("mut ");
+          removePrefix("view ");
+          removePrefix("lock ");
+          removePrefix("struct ");
+          removePrefix("class ");
 
           size_t arcPos = typeName.find("Arc<");
           size_t boxPos = typeName.find("Box<");
@@ -872,7 +1640,6 @@ public:
                   ? arcPos
                   : ((boxPos != std::string::npos) ? boxPos
                                                    : std::string::npos);
-
           if (startPos != std::string::npos) {
             typeName = typeName.substr(startPos + 4);
             size_t endPos = typeName.rfind(">");
@@ -880,95 +1647,185 @@ public:
               typeName = typeName.substr(0, endPos);
           }
 
-          while (!typeName.empty() &&
-                 (typeName[0] == '&' || typeName[0] == '*' ||
-                  typeName[0] == ' ')) {
-            typeName = typeName.substr(1);
+          if (!typeName.empty() && typeName.back() == '?') {
+            typeName.pop_back();
           }
 
-          if (typeName.find("struct ") == 0)
-            typeName = typeName.substr(7);
-          if (typeName.find("class ") == 0)
-            typeName = typeName.substr(6);
+          std::string dropName;
+          const hir::HIRType *coreValTy = stripMemoryModifiers(valTy);
+          if (auto *nTy =
+                  llvm::dyn_cast_or_null<hir::HIRNullableType>(coreValTy)) {
+            coreValTy = nTy->getInner();
+          }
 
-          std::string dropName = typeName + ".destructor_ret_void";
-          MIRFunction *dropFunc = mirModule->getFunction(dropName);
+          if (coreValTy && (coreValTy->getKind() == hir::TypeKind::Slice ||
+                            coreValTy->getKind() == hir::TypeKind::Array)) {
+            bool elemIsARC = false;
+            const hir::HIRType *elemTy = nullptr;
+            if (auto *slcTy = llvm::dyn_cast_or_null<hir::SliceType>(coreValTy))
+              elemTy = slcTy->getElementType();
+            else if (auto *arrTy =
+                         llvm::dyn_cast_or_null<hir::ArrayType>(coreValTy))
+              elemTy = arrTy->getElementType();
 
-          // Properly detect all ARC-managed types
-          bool isClosureType =
-              (valTy->getKind() == hir::TypeKind::Closure ||
-               valTy->toString().find("closure") != std::string::npos);
-          bool isAnyType = (valTy->getKind() == hir::TypeKind::Any);
+            if (elemTy) {
+              const hir::HIRType *checkElemTy = stripMemoryModifiers(elemTy);
+              if (auto *pTy =
+                      llvm::dyn_cast_or_null<hir::PointerType>(checkElemTy)) {
+                checkElemTy = stripMemoryModifiers(pTy->getPointee());
+              }
+              if (auto *nTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(
+                      checkElemTy)) {
+                checkElemTy = stripMemoryModifiers(nTy->getInner());
+              }
 
-          bool typeIsARC =
-              isARC || isClosureType || isAnyType ||
-              valTy->getKind() == hir::TypeKind::String ||
-              valTy->getKind() == hir::TypeKind::Map ||
-              valTy->getKind() == hir::TypeKind::Slice ||
-              valTy->getKind() == hir::TypeKind::Promise ||
-              valTy->getKind() == hir::TypeKind::Nullable ||
-              valTy->toString().find("Box<") != std::string::npos ||
-              valTy->toString().find("Arc<") != std::string::npos;
-
-          bool needsFree =
-              (!typeIsARC && valTy->getKind() == hir::TypeKind::Pointer);
-
-          if (dropFunc || typeIsARC || needsFree) {
-            auto *loaded = builder->insert(
-                std::make_unique<LoadInst>(allocaPtr, "cleanup_val", dropLoc));
-
-            if (dropFunc && !typeIsARC) {
-              MIRValue *argVal = allocaPtr;
-              if (!dropFunc->getRawArguments().empty()) {
-                const hir::HIRType *expectedTy =
-                    dropFunc->getRawArguments()[0]->getType();
-                if (argVal->getType() != expectedTy) {
-                  argVal = builder->createBitCast(argVal, expectedTy,
-                                                  "drop.cast", dropLoc);
+              if (checkElemTy) {
+                auto k = checkElemTy->getKind();
+                if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+                    k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
+                    k == hir::TypeKind::Closure ||
+                    k == hir::TypeKind::Function || k == hir::TypeKind::Any ||
+                    k == hir::TypeKind::Promise || k == hir::TypeKind::Struct ||
+                    checkElemTy->toString().find("Arc<") != std::string::npos ||
+                    checkElemTy->toString().find("Box<") != std::string::npos) {
+                  elemIsARC = true;
                 }
               }
-              builder->insert(std::make_unique<CallInst>(
-                  dropFunc, std::vector<MIRValue *>{argVal},
-                  dropFunc->getType(), "", false, dropLoc));
             }
 
-            if (typeIsARC) {
-              builder->insert(std::make_unique<ARCInst>(Opcode::Release, loaded,
-                                                        dropFunc, dropLoc));
-            } else if (needsFree) {
-              std::string freeName = "__moksha_free";
-              MIRFunction *freeFunc = mirModule->getFunction(freeName);
-              if (!freeFunc) {
+            if (elemIsARC) {
+              MIRFunction *arrDtor = getOrCreateArrayDestructor(coreValTy);
+              dropName = arrDtor->getName();
+            } else {
+              dropName = typeName + ".destructor_ret_void";
+            }
+          } else if (coreValTy && coreValTy->getKind() == hir::TypeKind::Map) {
+            dropName = "";
+          } else if (coreValTy && coreValTy->getKind() == hir::TypeKind::Any) {
+            dropName = getOrCreateAnyDestructor()->getName();
+          } else {
+            dropName = typeName + ".destructor_ret_void";
+          }
+
+          MIRFunction *dropFunc = mirModule->getFunction(dropName);
+
+          bool isStructLike = false;
+          if (valTy->getKind() != hir::TypeKind::Pointer &&
+              valTy->getKind() != hir::TypeKind::Reference) {
+            isStructLike =
+                (valTy->getKind() == hir::TypeKind::Any ||
+                 valTy->getKind() == hir::TypeKind::Closure ||
+                 valTy->getKind() == hir::TypeKind::Array ||
+                 valTy->getKind() == hir::TypeKind::Struct ||
+                 valTy->toString().find("closure") != std::string::npos ||
+                 valTy->toString().find("Closure.") != std::string::npos);
+          }
+
+          bool isArcPtr = isARC || valTy->getKind() == hir::TypeKind::String ||
+                          valTy->getKind() == hir::TypeKind::Map ||
+                          valTy->getKind() == hir::TypeKind::Slice ||
+                          valTy->getKind() == hir::TypeKind::Promise ||
+                          valTy->toString().find("Box<") != std::string::npos ||
+                          valTy->toString().find("Arc<") != std::string::npos;
+
+          if (valTy->toString().find("Closure.lambda.") != std::string::npos) {
+            isArcPtr = false;
+          }
+
+          bool needsFree = (!isArcPtr && !isStructLike &&
+                            valTy->getKind() == hir::TypeKind::Pointer);
+
+          if (dropFunc || isArcPtr || needsFree || isStructLike) {
+            if (isStructLike) {
+              // Structures (Any, Slice, Map, etc) MUST pass their pointer to
+              // CallInst
+              if (dropFunc) {
+                MIRValue *argVal = allocaPtr;
+                if (!dropFunc->getRawArguments().empty()) {
+                  const hir::HIRType *expectedTy =
+                      dropFunc->getRawArguments()[0]->getType();
+                  if (argVal->getType() != expectedTy) {
+                    argVal = builder->createBitCast(argVal, expectedTy,
+                                                    "drop.cast", dropLoc);
+                  }
+                }
+                auto *voidTy =
+                    const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+                builder->insert(std::make_unique<CallInst>(
+                    dropFunc, std::vector<MIRValue *>{argVal}, voidTy, "",
+                    false, dropLoc));
+              } else if (valTy->getKind() == hir::TypeKind::Closure ||
+                         valTy->toString().find("closure") !=
+                             std::string::npos) {
+                auto *loaded = builder->insert(
+                    std::make_unique<LoadInst>(allocaPtr, "clos.val", dropLoc));
                 auto *voidTy =
                     const_cast<hir::HIRModule *>(hirModule)->getVoidType();
                 auto *voidPtrTy =
                     const_cast<hir::HIRModule *>(hirModule)->getPointerType(
                         voidTy, hir::Ownership::None);
-                auto fn = std::make_unique<MIRFunction>(voidTy, freeName,
-                                                        Linkage::External);
-                fn->addArgument(
-                    std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
-                freeFunc = fn.get();
-                mirModule->addFunction(std::move(fn));
-              }
+                MIRValue *envPtr =
+                    builder->insert(std::make_unique<ExtractValueInst>(
+                        loaded, 1, voidPtrTy, "env.ext", dropLoc));
 
-              MIRValue *castToVoid = builder->createBitCast(
-                  loaded, freeFunc->getRawArguments()[0]->getType(),
-                  "free.cast", dropLoc);
-              builder->insert(std::make_unique<CallInst>(
-                  freeFunc, std::vector<MIRValue *>{castToVoid},
-                  freeFunc->getType(), "", false, dropLoc));
+                std::string relName = "moksha_rt_release_closure_env";
+                ensureBuiltinMIR(relName);
+                MIRFunction *relFunc = mirModule->getFunction(relName);
+                if (!relFunc) {
+                  auto fn = std::make_unique<MIRFunction>(voidTy, relName,
+                                                          Linkage::External);
+                  fn->addArgument(
+                      std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+                  relFunc = fn.get();
+                  mirModule->addFunction(std::move(fn));
+                }
+                builder->insert(std::make_unique<CallInst>(
+                    relFunc, std::vector<MIRValue *>{envPtr}, voidTy, "", false,
+                    dropLoc));
+              }
+            } else if (isArcPtr) {
+              // Real heap pointers (String, Promise, Arc<T>, Box<T>)
+              auto *loaded = builder->insert(std::make_unique<LoadInst>(
+                  allocaPtr, "cleanup_val", dropLoc));
+              builder->insert(std::make_unique<ARCInst>(Opcode::Release, loaded,
+                                                        dropFunc, dropLoc));
+            } else if (dropFunc || needsFree) {
+              // Other pointers that need custom free
+              if (dropFunc) {
+                MIRValue *argVal = allocaPtr;
+                if (!dropFunc->getRawArguments().empty()) {
+                  const hir::HIRType *expectedTy =
+                      dropFunc->getRawArguments()[0]->getType();
+                  if (argVal->getType() != expectedTy) {
+                    argVal = builder->createBitCast(argVal, expectedTy,
+                                                    "drop.cast", dropLoc);
+                  }
+                }
+                auto *voidTy =
+                    const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+                builder->insert(std::make_unique<CallInst>(
+                    dropFunc, std::vector<MIRValue *>{argVal}, voidTy, "",
+                    false, dropLoc));
+              }
             }
+            MIRValue *nullConst =
+                mirModule->getOrInsertConstant<ConstantNull>(valTy);
+            builder->insert(
+                std::make_unique<StoreInst>(nullConst, allocaPtr, dropLoc));
           }
         }
       }
     };
 
-    // 2. Drop and Free Unique/Owned Variables (LIFO)
+    // Drop and Free Unique/Owned Variables (LIFO)
     processDrops(ownedToProcess, false);
 
-    // 3. Release ARC Variables (LIFO)
+    // Release ARC Variables (LIFO)
     processDrops(sharedToProcess, true);
+    if (savedTerm) {
+      builder->getInsertBlock()->getInstructionsMut().push_back(
+          std::move(savedTerm));
+    }
 
     if (isUnwind) {
       scopeStack[scopeIdx].deferredStmts = std::move(defersToProcess);
@@ -1001,13 +1858,25 @@ private:
 
   std::unordered_set<MIRValue *> volatileVars;
 
+  // Ensure a stringifier is available for Any types
   void ensureStringifierForAny(const hir::HIRType *castOpTy) {
     if (!castOpTy)
       return;
     const hir::HIRType *checkTy = castOpTy;
+    bool needsPtr = false;
+
     if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
       checkTy = ptrTy->getPointee();
+    } else if (checkTy->getKind() == hir::TypeKind::Array ||
+               checkTy->getKind() == hir::TypeKind::Struct) {
+      needsPtr = true;
     }
+
+    if (needsPtr) {
+      castOpTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+          castOpTy, hir::Ownership::None);
+    }
+
     if (checkTy->getKind() == hir::TypeKind::Array ||
         checkTy->getKind() == hir::TypeKind::Slice) {
       getOrCreateArrayStringifier(castOpTy);
@@ -1016,13 +1885,176 @@ private:
     }
   }
 
+  // Emit a deep retain for a value, recursively unpacking Any/Slice/Struct
+  // pointers
+  void emitDeepRetain(MIRValue *ptrToVal, const hir::HIRType *ty, bool isTemp,
+                      SourceLocation loc) {
+    if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(ty)) {
+      if (pTy->getOwnership() == hir::Ownership::None ||
+          pTy->getOwnership() == hir::Ownership::Borrowed || pTy->isMut() ||
+          pTy->isView() || pTy->isLock()) {
+        return; // Native pointers do not get deep retained!
+      }
+    }
+
+    const hir::HIRType *checkTy = stripMemoryModifiers(ty);
+    if (auto *nTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy))
+      checkTy = stripMemoryModifiers(nTy->getInner());
+    if (!checkTy)
+      return;
+
+    // DETECT REFCLASSES: Prevent them from being iterated as standard structs
+    bool isRefClass = false;
+    if (auto *st = llvm::dyn_cast_or_null<hir::StructType>(checkTy)) {
+      if (st->isRefClass()) {
+        isRefClass = true;
+      }
+    }
+
+    bool isStructLike = false;
+    if (checkTy->getKind() != hir::TypeKind::Pointer &&
+        checkTy->getKind() != hir::TypeKind::Reference) {
+      isStructLike =
+          (checkTy->getKind() == hir::TypeKind::Any ||
+           checkTy->getKind() == hir::TypeKind::Closure ||
+           checkTy->getKind() == hir::TypeKind::Array ||
+           (checkTy->getKind() == hir::TypeKind::Struct && !isRefClass) ||
+           checkTy->toString().find("closure") != std::string::npos ||
+           checkTy->toString().find("Closure.") != std::string::npos);
+    }
+
+    bool isARCPointer = false;
+    if (!isStructLike) {
+      auto k = checkTy->getKind();
+      if (k == hir::TypeKind::String || k == hir::TypeKind::Map ||
+          k == hir::TypeKind::Promise || k == hir::TypeKind::Slice ||
+          checkTy->toString().find("Arc<") != std::string::npos ||
+          checkTy->toString().find("Box<") != std::string::npos || isRefClass) {
+        isARCPointer = true;
+      } else {
+        std::string cName = checkTy->toString();
+        while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
+                                  cName[0] == ' ' || cName[0] == '?'))
+          cName = cName.substr(1);
+        if (cName.find("struct.") == 0)
+          cName = cName.substr(7);
+        if (cName.find("class.") == 0)
+          cName = cName.substr(6);
+        for (const auto *cls : hirModule->getClasses()) {
+          if (cls->getName() == cName ||
+              cName.find(cls->getName() + "<") == 0) {
+            bool isRef = false;
+            const hir::HIRType *clsTy = cls->getType();
+            if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(clsTy)) {
+              isRef = true;
+              clsTy = pTy->getPointee();
+            } else if (auto *rTy =
+                           llvm::dyn_cast_or_null<hir::ReferenceType>(clsTy)) {
+              isRef = true;
+              clsTy = rTy->getInner();
+            }
+            if (auto *st = llvm::dyn_cast_or_null<hir::StructType>(clsTy)) {
+              if (st->isRefClass())
+                isRef = true;
+            }
+            if (isRef || cls->hasVTable())
+              isARCPointer = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (isStructLike) {
+      if (checkTy->getKind() == hir::TypeKind::Any) {
+        if (!isTemp) {
+          MIRValue *loaded = builder->createLoad(ptrToVal, "retain.load", loc);
+          auto *voidPtrTy =
+              const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                  const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
+                  hir::Ownership::None);
+          MIRValue *dataPtr =
+              builder->insert(std::make_unique<ExtractValueInst>(
+                  loaded, 0, voidPtrTy, "any.data.ext", loc));
+          builder->insert(
+              std::make_unique<ARCInst>(Opcode::Retain, dataPtr, nullptr, loc));
+        }
+      } else if (checkTy->getKind() == hir::TypeKind::Closure ||
+                 checkTy->toString().find("closure") != std::string::npos) {
+        if (!isTemp) {
+          MIRValue *loaded = builder->createLoad(ptrToVal, "retain.load", loc);
+          auto *voidPtrTy =
+              const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                  const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
+                  hir::Ownership::None);
+          MIRValue *envPtr = builder->insert(std::make_unique<ExtractValueInst>(
+              loaded, 1, voidPtrTy, "env.ext", loc));
+          builder->insert(
+              std::make_unique<ARCInst>(Opcode::Retain, envPtr, nullptr, loc));
+        }
+      } else if (checkTy->getKind() == hir::TypeKind::Array) {
+        auto *arrTy = llvm::cast<hir::ArrayType>(checkTy);
+        const hir::HIRType *elemTy = arrTy->getElementType();
+        auto *i32Ty =
+            const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+        auto *zero = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+        auto *expectedPtrTy =
+            const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                elemTy, hir::Ownership::None);
+
+        for (size_t i = 0; i < arrTy->getSize(); ++i) {
+          auto *idx = mirModule->getOrInsertConstant<ConstantInt>(i, i32Ty);
+          MIRValue *elemGep = builder->createGEP(ptrToVal, {zero, idx}, arrTy,
+                                                 "retain.arr.gep", loc);
+          if (elemGep->getType() != expectedPtrTy) {
+            elemGep = builder->createBitCast(elemGep, expectedPtrTy,
+                                             "retain.arr.cast", loc);
+          }
+          emitDeepRetain(elemGep, elemTy, isTemp, loc);
+        }
+      } else if (checkTy->getKind() == hir::TypeKind::Struct) {
+        auto *stTy = llvm::cast<hir::StructType>(checkTy);
+        auto *i32Ty =
+            const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+        auto *zero = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+
+        for (size_t i = 0; i < stTy->getFields().size(); ++i) {
+          const hir::HIRType *fieldTy = stTy->getFields()[i];
+          auto *idx = mirModule->getOrInsertConstant<ConstantInt>(i, i32Ty);
+          MIRValue *fieldGep = builder->createGEP(ptrToVal, {zero, idx}, stTy,
+                                                  "retain.struct.gep", loc);
+          auto *expectedPtrTy =
+              const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                  fieldTy, hir::Ownership::None);
+          if (fieldGep->getType() != expectedPtrTy) {
+            fieldGep = builder->createBitCast(fieldGep, expectedPtrTy,
+                                              "retain.struct.cast", loc);
+          }
+          emitDeepRetain(fieldGep, fieldTy, isTemp, loc);
+        }
+      }
+    } else if (isARCPointer) {
+      if (!isTemp) {
+        MIRValue *loaded = builder->createLoad(ptrToVal, "retain.load", loc);
+        builder->insert(
+            std::make_unique<ARCInst>(Opcode::Retain, loaded, nullptr, loc));
+      }
+    }
+  }
+
+  // Box a value into the destination type, handling Any/Slice/Struct pointers
   MIRValue *boxValue(MIRValue *val, const hir::HIRType *srcTy,
                      const hir::HIRType *destTy, SourceLocation loc) {
     if (!val || !srcTy || !destTy)
       return val;
 
-    if (srcTy->getKind() == hir::TypeKind::Any &&
-        destTy->getKind() == hir::TypeKind::Any)
+    bool srcIsAny = srcTy->getKind() == hir::TypeKind::Any;
+    if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(srcTy)) {
+      if (pTy->getPointee()->getKind() == hir::TypeKind::Any)
+        srcIsAny = true;
+    }
+
+    if (srcIsAny && destTy->getKind() == hir::TypeKind::Any)
       return val;
 
     const hir::HIRType *strippedSrc = stripMemoryModifiers(srcTy);
@@ -1085,28 +2117,16 @@ private:
       }
     }
 
-    bool strippedASTCast = false;
-    bool isFreshAllocation = false;
-
     if (destIsManaged) {
       MIRValue *trace = val;
       while (trace) {
         if (auto *cast = llvm::dyn_cast_or_null<CastInst>(trace)) {
           trace = cast->getValue();
-          if (trace->getType()->getKind() == hir::TypeKind::Pointer) {
-            strippedASTCast = true;
-          }
-        } else if (auto *call = llvm::dyn_cast_or_null<CallInst>(trace)) {
-          if (call->getCallee() &&
-              call->getCallee()->getName() == "__moksha_alloc") {
-            isFreshAllocation = true;
-          }
+        } else if (llvm::dyn_cast_or_null<LoadInst>(trace)) {
           break;
-        } else if (auto *invoke = llvm::dyn_cast_or_null<InvokeInst>(trace)) {
-          if (invoke->getCallee() &&
-              invoke->getCallee()->getName() == "__moksha_alloc") {
-            isFreshAllocation = true;
-          }
+        } else if (llvm::dyn_cast_or_null<CallInst>(trace)) {
+          break;
+        } else if (llvm::dyn_cast_or_null<InvokeInst>(trace)) {
           break;
         } else {
           break;
@@ -1206,11 +2226,15 @@ private:
         srcTy->getKind() == hir::TypeKind::Pointer ||
         srcTy->getKind() == hir::TypeKind::Reference || isManagedPtr) {
 
-      if (srcTy->getKind() == destTy->getKind() && !destIsAny) {
-        if (strippedASTCast && !isFreshAllocation) {
-          builder->insert(
-              std::make_unique<ARCInst>(Opcode::Retain, val, nullptr, loc));
-        }
+      const hir::HIRType *coreSrc = stripMemoryModifiers(srcTy);
+      if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(coreSrc))
+        coreSrc = stripMemoryModifiers(pTy->getPointee());
+
+      const hir::HIRType *coreDst = stripMemoryModifiers(destTy);
+      if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(coreDst))
+        coreDst = stripMemoryModifiers(pTy->getPointee());
+
+      if (coreSrc->getKind() == coreDst->getKind() && !destIsAny) {
         if (val->getType() != destTy) {
           val = builder->createBitCast(val, destTy, "box.alias.cast", loc);
         }
@@ -1218,17 +2242,10 @@ private:
       }
 
       if (destIsAny) {
-        ensureStringifierForAny(val->getType());
-        return builder->insert(std::make_unique<CastInst>(
-            Opcode::AnyCast, val, destTy, "box.anycast", loc));
+        return emitExplicitAnyBox(val, val->getType(), loc);
       }
 
       MIRValue *castVal = builder->createBitCast(val, destTy, "box.cast", loc);
-
-      if (strippedASTCast && !isFreshAllocation) {
-        builder->insert(
-            std::make_unique<ARCInst>(Opcode::Retain, castVal, nullptr, loc));
-      }
       return castVal;
     }
 
@@ -1299,9 +2316,14 @@ private:
                         ->getPointee()
                         ->getKind() == hir::TypeKind::Map)) {
       typeId = 17;
-    } else if (coreTy->getKind() == hir::TypeKind::Array ||
-               coreTy->getKind() == hir::TypeKind::Slice) {
+    } else if (coreTy->getKind() == hir::TypeKind::Slice) {
       typeId = 18;
+    } else if (coreTy->getKind() == hir::TypeKind::Array) {
+      typeId = 19;
+    } else if (coreTy->getKind() == hir::TypeKind::Closure ||
+               coreTy->toString().find("Closure.") != std::string::npos ||
+               coreTy->toString().find("closure") != std::string::npos) {
+      typeId = 21;
     } else if (coreTy->getKind() == hir::TypeKind::Promise) {
       typeId = 20;
     } else {
@@ -1312,6 +2334,43 @@ private:
         mirModule->getOrInsertConstant<ConstantInt>(typeId, i32Ty);
     MIRValue *rawBoxPtr = builder->createCall(
         allocFunc, {sizeVal, typeIdVal}, voidPtrTy, "box.alloc", false, loc);
+
+    if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(rawBoxPtr)) {
+      callInst->setReturnsOwned(true);
+    }
+
+    const hir::HIRType *boxTrackedTy =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            coreTy, hir::Ownership::None);
+    MIRValue *trackedBoxPtr =
+        builder->createBitCast(rawBoxPtr, boxTrackedTy, "box.track.typed", loc);
+
+    const hir::HIRType *ptrToBoxTrackedTy =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            boxTrackedTy, hir::Ownership::None);
+    auto allocaInst = std::make_unique<AllocaInst>(
+        ptrToBoxTrackedTy, boxTrackedTy, "box.temp.alloca", loc, 0);
+    MIRValue *tempAlloca = allocaInst.get();
+
+    MIRBlock *entryBlock = currFunc->getEntryBlock();
+    auto *nullVal = mirModule->getOrInsertConstant<ConstantNull>(boxTrackedTy);
+    auto storeNull = std::make_unique<StoreInst>(nullVal, tempAlloca, loc);
+
+    auto it = entryBlock->getInstructionsMut().insert(
+        entryBlock->getInstructionsMut().begin(), std::move(allocaInst));
+    entryBlock->getInstructionsMut().insert(std::next(it),
+                                            std::move(storeNull));
+
+    builder->insert(
+        std::make_unique<StoreInst>(trackedBoxPtr, tempAlloca, loc));
+    if (!scopeStack.empty()) {
+      scopeStack.back().refCountedVars.push_back(tempAlloca);
+    }
+
+    MIRValue *safeLoadedPtr = builder->insert(
+        std::make_unique<LoadInst>(tempAlloca, "new.box.load", loc));
+    rawBoxPtr =
+        builder->createBitCast(safeLoadedPtr, voidPtrTy, "box.safe.cast", loc);
 
     if (coreTy->getKind() == hir::TypeKind::Array ||
         coreTy->getKind() == hir::TypeKind::Struct) {
@@ -1346,18 +2405,55 @@ private:
           memcpyFunc, std::vector<MIRValue *>{rawBoxPtr, srcVoidPtr, sizeVal},
           voidTy, "", false, loc));
 
-      if (destIsAny) {
-        auto *typedPtrTy =
-            const_cast<hir::HIRModule *>(hirModule)->getPointerType(
-                coreTy, hir::Ownership::None);
-        auto *typedBoxPtr =
-            builder->createBitCast(rawBoxPtr, typedPtrTy, "box.typed", loc);
+      auto *typedPtrTy =
+          const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+              coreTy, hir::Ownership::None);
+      auto *typedBoxPtr =
+          builder->createBitCast(rawBoxPtr, typedPtrTy, "box.typed", loc);
 
-        ensureStringifierForAny(typedBoxPtr->getType());
-        return builder->insert(std::make_unique<CastInst>(
-            Opcode::AnyCast, typedBoxPtr, destTy, "box.anycast", loc));
+      bool isClosureType =
+          (coreTy->getKind() == hir::TypeKind::Closure ||
+           coreTy->toString().find("closure") != std::string::npos ||
+           coreTy->toString().find("Closure") != std::string::npos);
+
+      if (isClosureType) {
+        auto *voidPtrTy =
+            const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
+                hir::Ownership::None);
+        auto *i32Ty =
+            const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+        auto *zero = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+        auto *one = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+        MIRValue *envGep = builder->createGEP(typedBoxPtr, {zero, one}, coreTy,
+                                              "box.env.gep", loc);
+        auto *envPtrPtrTy =
+            const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                voidPtrTy, hir::Ownership::None);
+        MIRValue *castedEnvGep = builder->createBitCast(
+            envGep, envPtrPtrTy, "box.env.gep.cast", loc);
+
+        // Load the actual environment pointer
+        MIRValue *envPtr = builder->insert(
+            std::make_unique<LoadInst>(castedEnvGep, "box.env.load", loc));
+
+        builder->insert(
+            std::make_unique<ARCInst>(Opcode::Retain, envPtr, nullptr, loc));
+      } else {
+        emitDeepRetain(typedBoxPtr, coreTy, false, loc);
       }
 
+      if (destIsAny) {
+        if (!scopeStack.empty()) {
+          auto &shared = scopeStack.back().refCountedVars;
+          auto it = std::find(shared.begin(), shared.end(), tempAlloca);
+          if (it != shared.end())
+            shared.erase(it);
+        }
+
+        return emitExplicitAnyBox(typedBoxPtr, typedBoxPtr->getType(), loc,
+                                  true);
+      }
       return builder->createBitCast(rawBoxPtr, destTy, "box.final", loc);
     }
 
@@ -1371,39 +2467,64 @@ private:
     }
 
     if (destIsAny) {
-      ensureStringifierForAny(typedBoxPtr->getType());
-      return builder->insert(std::make_unique<CastInst>(
-          Opcode::AnyCast, typedBoxPtr, destTy, "box.anycast", loc));
+      if (!scopeStack.empty()) {
+        auto &shared = scopeStack.back().refCountedVars;
+        auto it = std::find(shared.begin(), shared.end(), tempAlloca);
+        if (it != shared.end())
+          shared.erase(it);
+      }
+
+      return emitExplicitAnyBox(typedBoxPtr, typedBoxPtr->getType(), loc, true);
     }
     return builder->createBitCast(typedBoxPtr, destTy, "box.final", loc);
   }
 
+  // Unbox a value from the source type to the destination type, handling
+  // Any/Slice/Struct pointers
   MIRValue *unboxValue(MIRValue *val, const hir::HIRType *srcTy,
                        const hir::HIRType *destTy, SourceLocation loc) {
     if (!val || !srcTy || !destTy)
       return val;
     if (srcTy->getKind() != hir::TypeKind::Any)
       return val;
-
     if (destTy->getKind() == hir::TypeKind::Any)
       return val;
 
+    auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
     auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
-        const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
-        hir::Ownership::None);
-    MIRValue *dataPtr = builder->insert(
-        std::make_unique<ExtractValueInst>(val, 0, voidPtrTy, "any.data", loc));
+        voidTy, hir::Ownership::None);
+    auto *i32Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
 
-    if (destTy->getKind() == hir::TypeKind::Pointer ||
-        destTy->getKind() == hir::TypeKind::Reference ||
-        destTy->getKind() == hir::TypeKind::String ||
-        destTy->getKind() == hir::TypeKind::Map ||
-        destTy->getKind() == hir::TypeKind::Closure ||
-        destTy->getKind() == hir::TypeKind::Any ||
-        destTy->getKind() == hir::TypeKind::Promise ||
-        destTy->getKind() == hir::TypeKind::Null ||
-        destTy->getKind() == hir::TypeKind::Array ||
-        destTy->getKind() == hir::TypeKind::Slice) {
+    auto *anyLayoutTy = const_cast<hir::HIRModule *>(hirModule)->getStructType(
+        "__moksha_any_layout", {voidPtrTy, voidPtrTy});
+    auto *anyLayoutPtrTy =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            anyLayoutTy, hir::Ownership::None);
+
+    MIRValue *layoutPtr =
+        builder->createBitCast(val, anyLayoutPtrTy, "any.layout.cast", loc);
+    auto *zero = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+    MIRValue *dataGep = builder->createGEP(layoutPtr, {zero, zero}, anyLayoutTy,
+                                           "any.data.gep", loc);
+    auto *voidPtrPtrTy =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            voidPtrTy, hir::Ownership::None);
+    MIRValue *dataGepCast =
+        builder->createBitCast(dataGep, voidPtrPtrTy, "any.data.gep.cast", loc);
+
+    MIRValue *dataPtr = builder->insert(
+        std::make_unique<LoadInst>(dataGepCast, "any.data.load", loc));
+
+    // Safely separate Native Pointers from Struct Values
+    bool isNativePtr = destTy->getKind() == hir::TypeKind::Pointer ||
+                       destTy->getKind() == hir::TypeKind::Reference ||
+                       destTy->getKind() == hir::TypeKind::String ||
+                       destTy->getKind() == hir::TypeKind::Map ||
+                       destTy->getKind() == hir::TypeKind::Slice ||
+                       destTy->getKind() == hir::TypeKind::Promise ||
+                       destTy->getKind() == hir::TypeKind::Null;
+
+    if (isNativePtr) {
       return builder->createBitCast(dataPtr, destTy, "unbox.cast", loc);
     }
 
@@ -1415,6 +2536,7 @@ private:
         std::make_unique<LoadInst>(typedPtr, "unbox.val", loc));
   }
 
+  // Check if a pointer is volatile (e.g., a global or casted constant)
   bool isVolatilePointer(MIRValue *ptr) {
     if (!ptr)
       return false;
@@ -1436,6 +2558,7 @@ private:
     return false;
   }
 
+  // Check if an identifier is used in a statement
   bool isIdentifierUsed(const hir::HIRStmt *stmt, const std::string &name) {
     if (!stmt)
       return false;
@@ -1461,6 +2584,7 @@ private:
     return false;
   }
 
+  // Apply the borrow kind to a MIR value based on the HIR type
   static void applyBorrowKind(mir::MIRValue *mirVal,
                               const hir::HIRType *hirType) {
     if (!mirVal || !hirType)
@@ -1498,6 +2622,7 @@ private:
     return ty->toString().find("weak ") != std::string::npos;
   }
 
+  // Generate the VTable for a class, if it has virtual methods
   void generateVTable(const hir::HIRClass *cls) {
     if (!cls->hasVTable())
       return;
@@ -1510,7 +2635,7 @@ private:
         const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
         hir::Ownership::None);
 
-    // 1. Collect virtual methods and determine VTable size
+    // Collect virtual methods and determine VTable size
     int maxIdx = -1;
     for (const auto &m : cls->getMethods()) {
       if (m->isVirtualFunc() || m->isOverrideFunc()) {
@@ -1521,7 +2646,7 @@ private:
     if (maxIdx == -1)
       return;
 
-    // 2. Populate the VTable Array with BitCasted Function Pointers
+    // Populate the VTable Array with BitCasted Function Pointers
     std::vector<MIRValue *> vtableEntries(
         maxIdx + 1, mirModule->getOrInsertConstant<ConstantNull>(voidPtrTy));
 
@@ -1556,7 +2681,7 @@ private:
       }
     }
 
-    // 3. Construct the Constant Array and Struct
+    // Construct the Constant Array and Struct
     auto *arrayTy = const_cast<hir::HIRModule *>(hirModule)->getArrayType(
         voidPtrTy, vtableEntries.size());
     auto *vtableArray = mirModule->getOrInsertConstant<ConstantArray>(
@@ -1570,11 +2695,12 @@ private:
     auto *vtableStruct = mirModule->getOrInsertConstant<ConstantStruct>(
         vtableStructTy, std::vector<MIRValue *>{rttiNull, vtableArray});
 
-    // 4. Emit the Global Variable
+    // Emit the Global Variable
     builder->createGlobal(mirModule.get(), vtableName, vtableStructTy,
                           vtableStruct, true, Linkage::External);
   }
 
+  // Coerce a value to a bool, handling modifier types
   MIRValue *coerceToBool(MIRValue *val, SourceLocation loc) {
     if (!val || !val->getType())
       return val;
@@ -1623,11 +2749,14 @@ private:
     return val;
   }
 
+  // Get or create the array stringifier function for a given type
   MIRFunction *getOrCreateArrayStringifier(const hir::HIRType *valTy) {
-    std::string tyStr = valTy->toString();
-
+    const hir::HIRType *nameTy = valTy;
+    if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(nameTy)) {
+      nameTy = ptrTy->getPointee();
+    }
+    std::string tyStr = nameTy->toString();
     tyStr.erase(std::remove(tyStr.begin(), tyStr.end(), '?'), tyStr.end());
-
     std::string funcName = "__moksha_array_to_string_" + tyStr;
     for (char &c : funcName)
       if (!isalnum(c))
@@ -1637,10 +2766,8 @@ private:
       return f;
 
     auto *strTy = const_cast<hir::HIRModule *>(hirModule)->getStringType();
-    auto *argTy = valTy;
-
-    auto fn = std::make_unique<MIRFunction>(strTy, funcName, Linkage::Internal);
-    fn->addArgument(std::make_unique<MIRArgument>(fn.get(), argTy, 0));
+    auto fn = std::make_unique<MIRFunction>(strTy, funcName, Linkage::Weak);
+    fn->addArgument(std::make_unique<MIRArgument>(fn.get(), valTy, 0));
     MIRFunction *func = fn.get();
     mirModule->addFunction(std::move(fn));
 
@@ -1669,7 +2796,6 @@ private:
                                            nullConst, boolTy, "is.null", loc);
     builder->createCondBr(isNull, nullRetBlock, validBlock);
 
-    // If Null -> return "null"
     builder->setInsertPoint(nullRetBlock);
     ensureBuiltinMIR("__moksha_cstr_to_string");
     MIRFunction *cstrFuncNull =
@@ -1692,19 +2818,15 @@ private:
         strTy, "null.str", false, loc);
     builder->insert(std::make_unique<ReturnInst>(nullStrRes, loc));
 
-    // If Valid -> Continue normal iteration
     builder->setInsertPoint(validBlock);
 
     auto *i32Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
     const hir::HIRType *actualColTy = valTy;
+
     if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(valTy)) {
       actualColTy = ptrTy->getPointee();
-      if (actualColTy->getKind() == hir::TypeKind::Slice) {
-        colVal = builder->createLoad(colVal, "slice.load", loc);
-      }
     }
 
-    // 1. Get Length & Data Ptr
     MIRValue *lenVal = nullptr;
     MIRValue *dataPtr = nullptr;
     const hir::HIRType *elemTy = nullptr;
@@ -1713,14 +2835,15 @@ private:
       elemTy = sliceTy->getElementType();
       auto *elemPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
           elemTy, hir::Ownership::None);
+      auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
       auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
-          const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
-          hir::Ownership::None);
+          voidTy, hir::Ownership::None);
 
       ensureBuiltinMIR("moksha_rt_array_data");
       ensureBuiltinMIR("moksha_rt_array_length");
       MIRFunction *dataFunc = mirModule->getFunction("moksha_rt_array_data");
       MIRFunction *lenFunc = mirModule->getFunction("moksha_rt_array_length");
+
       if (!dataFunc) {
         auto fn = std::make_unique<MIRFunction>(
             voidPtrTy, "moksha_rt_array_data", Linkage::External);
@@ -1748,31 +2871,20 @@ private:
       elemTy = arrTy->getElementType();
       lenVal =
           mirModule->getOrInsertConstant<ConstantInt>(arrTy->getSize(), i32Ty);
-
       auto *elemPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
           elemTy, hir::Ownership::None);
       dataPtr = builder->createBitCast(colVal, elemPtrTy, "arr.decay", loc);
     }
 
-    // 2. Setup Loop Variables
     MIRValue *idxAlloca = builder->createAlloca(i32Ty, "idx", loc);
     builder->insert(std::make_unique<StoreInst>(
         mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty), idxAlloca, loc));
 
     MIRValue *resAlloca = builder->createAlloca(strTy, "res", loc);
-
-    ensureBuiltinMIR("__moksha_cstr_to_string");
     MIRFunction *cstrFunc = mirModule->getFunction("__moksha_cstr_to_string");
     auto *i8Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(8, true);
     auto *i8PtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
         i8Ty, hir::Ownership::None);
-    if (!cstrFunc) {
-      auto fn2 = std::make_unique<MIRFunction>(strTy, "__moksha_cstr_to_string",
-                                               Linkage::External);
-      fn2->addArgument(std::make_unique<MIRArgument>(fn2.get(), i8PtrTy, 0));
-      cstrFunc = fn2.get();
-      mirModule->addFunction(std::move(fn2));
-    }
 
     MIRValue *openBrack = builder->createCall(
         cstrFunc,
@@ -1785,8 +2897,6 @@ private:
     MIRBlock *endBlock = newBlock("end");
 
     builder->createBr(condBlock);
-
-    // Cond Block
     builder->setInsertPoint(condBlock);
     MIRValue *idxVal = builder->createLoad(idxAlloca, "idx.val", loc);
     MIRValue *cmp = builder->createICmp(
@@ -1794,9 +2904,7 @@ private:
         const_cast<hir::HIRModule *>(hirModule)->getBoolType(), "cmp", loc);
     builder->createCondBr(cmp, bodyBlock, endBlock);
 
-    // Body Block
     builder->setInsertPoint(bodyBlock);
-
     MIRBlock *commaBlock = newBlock("comma");
     MIRBlock *elemBlock = newBlock("elem");
     MIRValue *isGtZero = builder->createICmp(
@@ -1829,10 +2937,8 @@ private:
     builder->createBr(elemBlock);
 
     builder->setInsertPoint(elemBlock);
-
-    MIRValue *elemPtr = nullptr;
-    elemPtr = builder->createGEP(dataPtr, {idxVal}, elemTy, "elem.ptr", loc);
-
+    MIRValue *elemPtr =
+        builder->createGEP(dataPtr, {idxVal}, elemTy, "elem.ptr", loc);
     MIRValue *elemLoad = builder->createLoad(elemPtr, "elem.load", loc);
     MIRValue *elemStr = coerceToString(elemLoad, loc);
     MIRValue *curRes2 = builder->createLoad(resAlloca, "res.val2", loc);
@@ -1846,7 +2952,6 @@ private:
     builder->insert(std::make_unique<StoreInst>(nextIdx, idxAlloca, loc));
     builder->createBr(condBlock);
 
-    // End Block
     builder->setInsertPoint(endBlock);
     MIRValue *closeBrack = builder->createCall(
         cstrFunc,
@@ -1857,21 +2962,308 @@ private:
                                              strTy, "concat3", false, loc);
 
     builder->insert(std::make_unique<ReturnInst>(finalStr, loc));
-
-    // Restore
     builder->setInsertPoint(savedBlock);
     currFunc = savedFunc;
     scopeStack = savedScope;
     symbolMap = savedMap;
+    func->numberUnnamedValues();
+    return func;
+  }
+
+  // Get or create the array destructor function for a given type
+  MIRFunction *getOrCreateArrayDestructor(const hir::HIRType *colTy) {
+    const hir::HIRType *nameTy = colTy;
+    if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(nameTy)) {
+      nameTy = ptrTy->getPointee();
+    }
+    std::string tyStr = nameTy->toString();
+    tyStr.erase(std::remove(tyStr.begin(), tyStr.end(), '?'), tyStr.end());
+    std::string funcName = "__moksha_array_dtor_" + tyStr;
+    for (char &c : funcName)
+      if (!isalnum(c))
+        c = '_';
+
+    if (MIRFunction *f = mirModule->getFunction(funcName))
+      return f;
+
+    auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+    auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        voidTy, hir::Ownership::None);
+    auto *i32Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+
+    auto fn = std::make_unique<MIRFunction>(voidTy, funcName, Linkage::Weak);
+    fn->addArgument(std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+    MIRFunction *func = fn.get();
+    mirModule->addFunction(std::move(fn));
+
+    MIRBlock *savedBlock = builder->getInsertBlock();
+    MIRFunction *savedFunc = currFunc;
+
+    currFunc = func;
+    MIRBlock *entry = newBlock("entry");
+    builder->setInsertPoint(entry);
+    SourceLocation loc{};
+
+    MIRValue *colVal = func->getRawArguments()[0];
+
+    MIRBlock *nullRetBlock = newBlock("arr.null.ret");
+    MIRBlock *validBlock = newBlock("arr.valid");
+
+    auto *nullConst = mirModule->getOrInsertConstant<ConstantNull>(voidPtrTy);
+    auto *boolTy = const_cast<hir::HIRModule *>(hirModule)->getBoolType();
+    MIRValue *isNull = builder->createICmp(CompareInst::Predicate::EQ, colVal,
+                                           nullConst, boolTy, "is.null", loc);
+    builder->createCondBr(isNull, nullRetBlock, validBlock);
+
+    builder->setInsertPoint(nullRetBlock);
+    builder->insert(std::make_unique<ReturnInst>(nullptr, loc));
+
+    builder->setInsertPoint(validBlock);
+
+    MIRValue *rawData = nullptr;
+    MIRValue *lenVal = nullptr;
+    MIRValue *isView = nullptr;
+
+    if (llvm::dyn_cast_or_null<hir::SliceType>(colTy)) {
+      ensureBuiltinMIR("moksha_rt_array_data");
+      ensureBuiltinMIR("moksha_rt_array_length");
+      ensureBuiltinMIR("moksha_rt_array_capacity");
+
+      MIRFunction *dataFunc = mirModule->getFunction("moksha_rt_array_data");
+      if (!dataFunc) {
+        auto dfn = std::make_unique<MIRFunction>(
+            voidPtrTy, "moksha_rt_array_data", Linkage::External);
+        dfn->addArgument(
+            std::make_unique<MIRArgument>(dfn.get(), voidPtrTy, 0));
+        dataFunc = dfn.get();
+        mirModule->addFunction(std::move(dfn));
+      }
+
+      MIRFunction *lenFunc = mirModule->getFunction("moksha_rt_array_length");
+      if (!lenFunc) {
+        auto lfn = std::make_unique<MIRFunction>(
+            i32Ty, "moksha_rt_array_length", Linkage::External);
+        lfn->addArgument(
+            std::make_unique<MIRArgument>(lfn.get(), voidPtrTy, 0));
+        lenFunc = lfn.get();
+        mirModule->addFunction(std::move(lfn));
+      }
+
+      MIRFunction *capFunc = mirModule->getFunction("moksha_rt_array_capacity");
+      if (!capFunc) {
+        auto cfn = std::make_unique<MIRFunction>(
+            i32Ty, "moksha_rt_array_capacity", Linkage::External);
+        cfn->addArgument(
+            std::make_unique<MIRArgument>(cfn.get(), voidPtrTy, 0));
+        capFunc = cfn.get();
+        mirModule->addFunction(std::move(cfn));
+      }
+
+      MIRValue *voidCol =
+          builder->createBitCast(colVal, voidPtrTy, "slice.void.cast", loc);
+      rawData = builder->createCall(dataFunc, {voidCol}, voidPtrTy,
+                                    "slice.data.raw", false, loc);
+      lenVal = builder->createCall(lenFunc, {voidCol}, i32Ty, "slice.len",
+                                   false, loc);
+
+      MIRValue *capVal = builder->createCall(capFunc, {voidCol}, i32Ty,
+                                             "slice.cap", false, loc);
+      MIRValue *zeroCap = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+      isView = builder->createICmp(CompareInst::Predicate::EQ, capVal, zeroCap,
+                                   boolTy, "is.view", loc);
+
+    } else if (auto *arrTy = llvm::dyn_cast_or_null<hir::ArrayType>(colTy)) {
+      // Fixed arrays bypass the runtime slice headers completely
+      rawData = builder->createBitCast(colVal, voidPtrTy, "arr.decay", loc);
+      lenVal =
+          mirModule->getOrInsertConstant<ConstantInt>(arrTy->getSize(), i32Ty);
+      isView = mirModule->getOrInsertConstant<ConstantBool>(false, boolTy);
+    }
+
+    MIRBlock *viewRetBlock = newBlock("arr.view.ret");
+    MIRBlock *ownedBlock = newBlock("arr.owned");
+
+    builder->createCondBr(isView, viewRetBlock, ownedBlock);
+
+    builder->setInsertPoint(viewRetBlock);
+    builder->insert(std::make_unique<ReturnInst>(nullptr, loc));
+
+    builder->setInsertPoint(ownedBlock);
+
+    const hir::HIRType *elemTy = nullptr;
+    if (auto *sliceTy = llvm::dyn_cast_or_null<hir::SliceType>(colTy))
+      elemTy = sliceTy->getElementType();
+    else if (auto *arrTy = llvm::dyn_cast_or_null<hir::ArrayType>(colTy))
+      elemTy = arrTy->getElementType();
+
+    // Determine physical layout and ARC status for Ref Classes
+    bool isArcElement = false;
+    const hir::HIRType *physicalElemTy = elemTy;
+    const hir::HIRType *coreElemTy = stripMemoryModifiers(elemTy);
+
+    if (coreElemTy) {
+      const hir::HIRType *checkTy = coreElemTy;
+      if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+        checkTy = pTy->getPointee();
+      }
+      if (auto *nTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+        checkTy = nTy->getInner();
+      }
+
+      if (checkTy) {
+        auto k = checkTy->getKind();
+        if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+            k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+            k == hir::TypeKind::Any || k == hir::TypeKind::Promise ||
+            checkTy->toString().find("Arc<") != std::string::npos ||
+            checkTy->toString().find("Box<") != std::string::npos) {
+          isArcElement = true;
+        } else if (auto *stTy =
+                       llvm::dyn_cast_or_null<hir::StructType>(checkTy)) {
+          if (stTy->isRefClass() ||
+              checkTy->toString().find("class.") != std::string::npos) {
+            isArcElement = true;
+            // A RefClass in an array literal is physically stored as a pointer
+            if (coreElemTy->getKind() == hir::TypeKind::Struct) {
+              physicalElemTy =
+                  const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                      coreElemTy, hir::Ownership::None);
+            }
+          }
+        }
+      }
+
+      if (!isArcElement &&
+          llvm::dyn_cast_or_null<hir::PointerType>(coreElemTy)) {
+        auto *pTy = llvm::cast<hir::PointerType>(coreElemTy);
+        if (pTy->getOwnership() == hir::Ownership::Shared ||
+            pTy->getOwnership() == hir::Ownership::Owned) {
+          isArcElement = true;
+        }
+      }
+    }
+
+    auto *elemPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        physicalElemTy, hir::Ownership::None);
+    MIRValue *dataPtr =
+        builder->createBitCast(rawData, elemPtrTy, "slice.ptr", loc);
+
+    MIRValue *idxAlloca = builder->createAlloca(i32Ty, "idx", loc);
+    builder->insert(std::make_unique<StoreInst>(
+        mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty), idxAlloca, loc));
+
+    MIRBlock *condBlock = newBlock("cond");
+    MIRBlock *bodyBlock = newBlock("body");
+    MIRBlock *endBlock = newBlock("end");
+
+    builder->createBr(condBlock);
+    builder->setInsertPoint(condBlock);
+    MIRValue *idxVal = builder->createLoad(idxAlloca, "idx.val", loc);
+    MIRValue *cmp = builder->createICmp(CompareInst::Predicate::LT, idxVal,
+                                        lenVal, boolTy, "cmp", loc);
+    builder->createCondBr(cmp, bodyBlock, endBlock);
+
+    builder->setInsertPoint(bodyBlock);
+
+    // GEP now calculates correctly using the physical pointer size
+    MIRValue *elemPtr =
+        builder->createGEP(dataPtr, {idxVal}, physicalElemTy, "elem.ptr", loc);
+    MIRValue *elemLoad = builder->createLoad(elemPtr, "elem.load", loc);
+
+    std::string elemDropName = "";
+    const hir::HIRType *dtorCheckTy = coreElemTy;
+    while (dtorCheckTy) {
+      if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(dtorCheckTy)) {
+        dtorCheckTy = stripMemoryModifiers(pTy->getPointee());
+      } else if (auto *nTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(
+                     dtorCheckTy)) {
+        dtorCheckTy = stripMemoryModifiers(nTy->getInner());
+      } else if (auto *rTy =
+                     llvm::dyn_cast_or_null<hir::ReferenceType>(dtorCheckTy)) {
+        dtorCheckTy = stripMemoryModifiers(rTy->getInner());
+      } else {
+        break;
+      }
+    }
+
+    if (dtorCheckTy && (dtorCheckTy->getKind() == hir::TypeKind::Slice ||
+                        dtorCheckTy->getKind() == hir::TypeKind::Array)) {
+      elemDropName = getOrCreateArrayDestructor(dtorCheckTy)->getName();
+    } else if (dtorCheckTy && dtorCheckTy->getKind() == hir::TypeKind::Map) {
+      elemDropName = getOrCreateMapDestructor(dtorCheckTy)->getName();
+    } else if (dtorCheckTy) {
+      std::string tName = dtorCheckTy->toString();
+      while (!tName.empty() && (tName[0] == '&' || tName[0] == '*' ||
+                                tName[0] == ' ' || tName[0] == '?'))
+        tName = tName.substr(1);
+      size_t arcPos = tName.find("Arc<");
+      if (arcPos != std::string::npos) {
+        tName = tName.substr(arcPos + 4);
+        size_t endPos = tName.rfind(">");
+        if (endPos != std::string::npos)
+          tName = tName.substr(0, endPos);
+      }
+      elemDropName = tName + ".destructor_ret_void";
+    }
+
+    MIRFunction *elemDropFunc =
+        elemDropName.empty() ? nullptr : mirModule->getFunction(elemDropName);
+    if (isArcElement) {
+      builder->insert(std::make_unique<ARCInst>(Opcode::Release, elemLoad,
+                                                elemDropFunc, loc));
+    } else if (dtorCheckTy->getKind() == hir::TypeKind::Array ||
+               dtorCheckTy->getKind() == hir::TypeKind::Struct) {
+      if (elemDropFunc) {
+        MIRValue *argVal = builder->createBitCast(
+            elemPtr, elemDropFunc->getRawArguments()[0]->getType(), "drop.cast",
+            loc);
+        builder->insert(std::make_unique<CallInst>(
+            elemDropFunc, std::vector<MIRValue *>{argVal}, voidTy, "", false,
+            loc));
+      }
+    }
+
+    MIRValue *nextIdx = builder->createAdd(
+        idxVal, mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty),
+        "idx.next", loc);
+    builder->insert(std::make_unique<StoreInst>(nextIdx, idxAlloca, loc));
+    builder->createBr(condBlock);
+
+    builder->setInsertPoint(endBlock);
+    builder->insert(std::make_unique<ReturnInst>(nullptr, loc));
+
+    builder->setInsertPoint(savedBlock);
+    currFunc = savedFunc;
+    func->numberUnnamedValues();
+    return func;
+  }
+
+  // Get or create the map destructor function for a given type
+  MIRFunction *getOrCreateMapDestructor(const hir::HIRType *colTy) {
+    std::string funcName = "moksha_rt_map_free_internal";
+    if (MIRFunction *f = mirModule->getFunction(funcName))
+      return f;
+    auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+    auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        voidTy, hir::Ownership::None);
+    auto fn =
+        std::make_unique<MIRFunction>(voidTy, funcName, Linkage::External);
+    fn->addArgument(std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+
+    MIRFunction *func = fn.get();
+    mirModule->addFunction(std::move(fn));
 
     return func;
   }
 
+  // Get or create the map stringifier function for a given type
   MIRFunction *getOrCreateMapStringifier(const hir::HIRType *valTy) {
-    std::string tyStr = valTy->toString();
-
+    const hir::HIRType *nameTy = valTy;
+    if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(nameTy)) {
+      nameTy = ptrTy->getPointee();
+    }
+    std::string tyStr = nameTy->toString();
     tyStr.erase(std::remove(tyStr.begin(), tyStr.end(), '?'), tyStr.end());
-
     std::string funcName = "__moksha_map_to_string_" + tyStr;
     for (char &c : funcName)
       if (!isalnum(c))
@@ -1881,10 +3273,8 @@ private:
       return f;
 
     auto *strTy = const_cast<hir::HIRModule *>(hirModule)->getStringType();
-    auto *argTy = valTy;
-
-    auto fn = std::make_unique<MIRFunction>(strTy, funcName, Linkage::Internal);
-    fn->addArgument(std::make_unique<MIRArgument>(fn.get(), argTy, 0));
+    auto fn = std::make_unique<MIRFunction>(strTy, funcName, Linkage::Weak);
+    fn->addArgument(std::make_unique<MIRArgument>(fn.get(), valTy, 0));
     MIRFunction *func = fn.get();
     mirModule->addFunction(std::move(fn));
 
@@ -1943,13 +3333,9 @@ private:
         voidTy, hir::Ownership::None);
     auto *anyTy = const_cast<hir::HIRModule *>(hirModule)->getAnyType();
 
-    // Unwrap pointers to maps passed by reference
     const hir::HIRType *actualColTy = valTy;
     if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(valTy)) {
       actualColTy = ptrTy->getPointee();
-      if (actualColTy->getKind() == hir::TypeKind::Map) {
-        mapVal = builder->createLoad(mapVal, "map.load", loc);
-      }
     }
 
     MIRValue *mapPtr =
@@ -1972,19 +3358,10 @@ private:
         mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty), idxAlloca, loc));
 
     MIRValue *resAlloca = builder->createAlloca(strTy, "res", loc);
-
-    ensureBuiltinMIR("__moksha_cstr_to_string");
     MIRFunction *cstrFunc = mirModule->getFunction("__moksha_cstr_to_string");
     auto *i8Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(8, true);
     auto *i8PtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
         i8Ty, hir::Ownership::None);
-    if (!cstrFunc) {
-      auto fn2 = std::make_unique<MIRFunction>(strTy, "__moksha_cstr_to_string",
-                                               Linkage::External);
-      fn2->addArgument(std::make_unique<MIRArgument>(fn2.get(), i8PtrTy, 0));
-      cstrFunc = fn2.get();
-      mirModule->addFunction(std::move(fn2));
-    }
 
     MIRValue *openBrack = builder->createCall(
         cstrFunc,
@@ -1997,24 +3374,19 @@ private:
     MIRBlock *endBlock = newBlock("end");
 
     builder->createBr(condBlock);
-
-    // Cond Block
     builder->setInsertPoint(condBlock);
     MIRValue *idxVal = builder->createLoad(idxAlloca, "idx.val", loc);
-    MIRValue *cmp = builder->createICmp(
-        CompareInst::Predicate::LT, idxVal, lenVal,
-        const_cast<hir::HIRModule *>(hirModule)->getBoolType(), "cmp", loc);
+    MIRValue *cmp = builder->createICmp(CompareInst::Predicate::LT, idxVal,
+                                        lenVal, boolTy, "cmp", loc);
     builder->createCondBr(cmp, bodyBlock, endBlock);
 
-    // Body Block
     builder->setInsertPoint(bodyBlock);
-
     MIRBlock *commaBlock = newBlock("comma");
     MIRBlock *elemBlock = newBlock("elem");
     MIRValue *isGtZero = builder->createICmp(
         CompareInst::Predicate::GT, idxVal,
-        mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty),
-        const_cast<hir::HIRModule *>(hirModule)->getBoolType(), "gt0", loc);
+        mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty), boolTy, "gt0",
+        loc);
     builder->createCondBr(isGtZero, commaBlock, elemBlock);
 
     ensureBuiltinMIR("__moksha_string_concat");
@@ -2040,7 +3412,6 @@ private:
     builder->createBr(elemBlock);
 
     builder->setInsertPoint(elemBlock);
-
     const hir::HIRType *abiAnyTy = getABICoercedType(anyTy, true);
 
     ensureBuiltinMIR("moksha_rt_map_get_key_at");
@@ -2119,7 +3490,6 @@ private:
     builder->insert(std::make_unique<StoreInst>(nextIdx, idxAlloca, loc));
     builder->createBr(condBlock);
 
-    // End Block
     builder->setInsertPoint(endBlock);
     MIRValue *closeBrack = builder->createCall(
         cstrFunc,
@@ -2131,15 +3501,149 @@ private:
 
     builder->insert(std::make_unique<ReturnInst>(finalStr, loc));
 
-    // Restore
     builder->setInsertPoint(savedBlock);
     currFunc = savedFunc;
     scopeStack = savedScope;
     symbolMap = savedMap;
-
+    func->numberUnnamedValues();
     return func;
   }
 
+  // Get or create the any destructor function
+  MIRFunction *getOrCreateAnyDestructor() {
+    std::string funcName = "__moksha_any_dtor";
+    if (MIRFunction *f = mirModule->getFunction(funcName))
+      return f;
+
+    auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+    auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        voidTy, hir::Ownership::None);
+    auto *anyTy = const_cast<hir::HIRModule *>(hirModule)->getAnyType();
+    auto *anyPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        anyTy, hir::Ownership::None);
+
+    auto fn = std::make_unique<MIRFunction>(voidTy, funcName, Linkage::Weak);
+    fn->addArgument(std::make_unique<MIRArgument>(fn.get(), anyPtrTy, 0));
+    MIRFunction *func = fn.get();
+    mirModule->addFunction(std::move(fn));
+
+    MIRBlock *savedBlock = builder->getInsertBlock();
+    MIRFunction *savedFunc = currFunc;
+    currFunc = func;
+
+    MIRBlock *entry = newBlock("entry");
+    builder->setInsertPoint(entry);
+
+    MIRValue *anyPtr = func->getRawArguments()[0];
+
+    auto *dtorSignature =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            const_cast<hir::HIRModule *>(hirModule)->getFunctionType(
+                voidTy, {voidPtrTy}),
+            hir::Ownership::None);
+
+    auto *dtorAlloca = builder->createAlloca(dtorSignature, "dtor.ptr.spill",
+                                             SourceLocation{});
+    MIRBlock *checkDataBlock = newBlock("any.check.data");
+    MIRBlock *nullRetBlock = newBlock("any.null.ret");
+    MIRBlock *validBlock = newBlock("any.valid");
+    auto *boolTy = const_cast<hir::HIRModule *>(hirModule)->getBoolType();
+
+    // Safety check: Is the pointer to the box itself null?
+    auto *nullPtrConst = mirModule->getOrInsertConstant<ConstantNull>(anyPtrTy);
+    MIRValue *isPtrNull =
+        builder->createICmp(CompareInst::Predicate::EQ, anyPtr, nullPtrConst,
+                            boolTy, "is.ptr.null", SourceLocation{});
+    builder->createCondBr(isPtrNull, nullRetBlock, checkDataBlock);
+
+    builder->setInsertPoint(checkDataBlock);
+    MIRValue *loadedAny = builder->insert(
+        std::make_unique<LoadInst>(anyPtr, "any.val.load", SourceLocation{}));
+    MIRValue *dataPtr = builder->insert(std::make_unique<ExtractValueInst>(
+        loadedAny, 0, voidPtrTy, "data.ptr", SourceLocation{}));
+    auto *nullDataConst =
+        mirModule->getOrInsertConstant<ConstantNull>(voidPtrTy);
+    MIRValue *isDataNull =
+        builder->createICmp(CompareInst::Predicate::EQ, dataPtr, nullDataConst,
+                            boolTy, "is.data.null", SourceLocation{});
+
+    builder->createCondBr(isDataNull, nullRetBlock, validBlock);
+    builder->setInsertPoint(nullRetBlock);
+    builder->insert(std::make_unique<ReturnInst>(nullptr, SourceLocation{}));
+    builder->setInsertPoint(validBlock);
+
+    MIRValue *vtablePtr = builder->insert(std::make_unique<ExtractValueInst>(
+        loadedAny, 1, voidPtrTy, "vtable.ptr", SourceLocation{}));
+
+    MIRBlock *vtableValidBlock = newBlock("any.vtable.valid");
+    MIRBlock *dtorCallBlock = newBlock("any.dtor.call");
+
+    auto *nullVTableConst =
+        mirModule->getOrInsertConstant<ConstantNull>(voidPtrTy);
+    MIRValue *isVTableNull = builder->createICmp(
+        CompareInst::Predicate::EQ, vtablePtr, nullVTableConst, boolTy,
+        "is.vtable.null", SourceLocation{});
+    auto *nullDtorConst =
+        mirModule->getOrInsertConstant<ConstantNull>(dtorSignature);
+
+    builder->insert(std::make_unique<StoreInst>(nullDtorConst, dtorAlloca,
+                                                SourceLocation{}));
+    builder->createCondBr(isVTableNull, dtorCallBlock, vtableValidBlock);
+    builder->setInsertPoint(vtableValidBlock);
+
+    auto *i32Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+    auto *voidPtrPtrTy =
+        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            voidPtrTy, hir::Ownership::None);
+
+    auto *three = mirModule->getOrInsertConstant<ConstantInt>(3, i32Ty);
+    MIRValue *vtableArrPtr = builder->createBitCast(
+        vtablePtr, voidPtrPtrTy, "vtable.arr.cast", SourceLocation{});
+
+    MIRValue *dtorFuncGep = builder->createGEP(vtableArrPtr, {three}, voidPtrTy,
+                                               "dtor.gep", SourceLocation{});
+    MIRValue *dtorFuncPtr = builder->insert(std::make_unique<LoadInst>(
+        dtorFuncGep, "dtor.func.ptr", SourceLocation{}));
+
+    MIRValue *callableDtor = builder->createBitCast(
+        dtorFuncPtr, dtorSignature, "dtor.callable", SourceLocation{});
+
+    // Update the spilled destructor with the valid one
+    builder->insert(std::make_unique<StoreInst>(callableDtor, dtorAlloca,
+                                                SourceLocation{}));
+    builder->createBr(dtorCallBlock);
+    builder->setInsertPoint(dtorCallBlock);
+
+    // Load the final destructor decision from the alloca
+    MIRValue *loadedDtor = builder->insert(std::make_unique<LoadInst>(
+        dtorAlloca, "dtor.loaded", SourceLocation{}));
+
+    std::string relName = "moksha_rt_release_with_dtor";
+    MIRFunction *relFunc = mirModule->getFunction(relName);
+    if (!relFunc) {
+      auto relFn =
+          std::make_unique<MIRFunction>(voidTy, relName, Linkage::External);
+      relFn->addArgument(
+          std::make_unique<MIRArgument>(relFn.get(), voidPtrTy, 0));
+      relFn->addArgument(
+          std::make_unique<MIRArgument>(relFn.get(), dtorSignature, 1));
+      relFunc = relFn.get();
+      mirModule->addFunction(std::move(relFn));
+    }
+
+    builder->insert(std::make_unique<CallInst>(
+        relFunc, std::vector<MIRValue *>{dataPtr, loadedDtor}, voidTy, "",
+        false, SourceLocation{}));
+
+    builder->insert(std::make_unique<ReturnInst>(nullptr, SourceLocation{}));
+
+    builder->setInsertPoint(savedBlock);
+    currFunc = savedFunc;
+    func->numberUnnamedValues();
+    return func;
+  }
+
+  // Coerce a value to a string, handling nullable types
   MIRValue *coerceToString(MIRValue *val, SourceLocation loc) {
     if (val->getType()->getKind() == hir::TypeKind::String)
       return val;
@@ -2299,15 +3803,25 @@ private:
         typeName = "cstr";
       } else if (checkTy->getKind() == hir::TypeKind::Array ||
                  checkTy->getKind() == hir::TypeKind::Slice) {
-        MIRFunction *strFunc = getOrCreateArrayStringifier(valTy);
+        MIRValue *argVal = val;
+        if (checkTy->getKind() == hir::TypeKind::Array &&
+            argVal->getType()->getKind() != hir::TypeKind::Pointer) {
+          auto *spill =
+              builder->createAlloca(argVal->getType(), "arr.str.spill", loc);
+          builder->insert(std::make_unique<StoreInst>(argVal, spill, loc));
+          argVal = spill;
+        }
+
+        MIRFunction *strFunc = getOrCreateArrayStringifier(argVal->getType());
         return builder->createCall(
-            strFunc, {val},
+            strFunc, {argVal},
             const_cast<hir::HIRModule *>(hirModule)->getStringType(),
             "arr.to_str", false, loc);
       } else if (checkTy->getKind() == hir::TypeKind::Map) {
-        MIRFunction *strFunc = getOrCreateMapStringifier(valTy);
+        MIRValue *argVal = val;
+        MIRFunction *strFunc = getOrCreateMapStringifier(argVal->getType());
         return builder->createCall(
-            strFunc, {val},
+            strFunc, {argVal},
             const_cast<hir::HIRModule *>(hirModule)->getStringType(),
             "map.to_str", false, loc);
       } else {
@@ -2323,12 +3837,15 @@ private:
 
     std::string toStringName = "__moksha_" + typeName + "_to_string";
     MIRFunction *toStringFunc = mirModule->getFunction(toStringName);
-    const hir::HIRType *abiValTy = getABICoercedType(valTy, true);
 
     if (!toStringFunc) {
       auto fn = std::make_unique<MIRFunction>(stringTy, toStringName,
                                               Linkage::External);
-      fn->addArgument(std::make_unique<MIRArgument>(fn.get(), abiValTy, 0));
+      auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+          const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
+          hir::Ownership::None);
+
+      fn->addArgument(std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
       toStringFunc = fn.get();
       mirModule->addFunction(std::move(fn));
     }
@@ -2349,8 +3866,23 @@ private:
       }
     }
 
-    return builder->createCall(toStringFunc, {val}, stringTy,
-                               typeName + ".to_str", false, loc);
+    MIRValue *strRes = builder->createCall(toStringFunc, {val}, stringTy,
+                                           typeName + ".to_str", false, loc);
+    if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(strRes)) {
+      callInst->setReturnsOwned(true);
+    }
+
+    auto *trackedAlloca =
+        createHoistedAlloca(stringTy, "str.temp.tracked", loc);
+    builder->insert(std::make_unique<StoreInst>(strRes, trackedAlloca, loc));
+    if (!scopeStack.empty()) {
+      scopeStack.back().refCountedVars.push_back(trackedAlloca);
+    }
+
+    auto *loadInst = builder->insert(
+        std::make_unique<LoadInst>(trackedAlloca, "str.safe.load", loc));
+    loadInst->setBorrowKind(mir::BorrowKind::View);
+    return loadInst;
   }
 
   // Helper function to evaluate string escapes down to raw bytes
@@ -2421,8 +3953,10 @@ private:
     return out;
   }
 
+  // Convert a HIR type to a MIR type
   const hir::HIRType *getMIRType(const hir::HIRType *t) { return t; }
 
+  // Create a new MIR block
   MIRBlock *newBlock(const std::string &name) {
     std::string safeName = currFunc ? currFunc->getUniqueName(name) : name;
     auto block = std::make_unique<MIRBlock>(safeName, currFunc);
@@ -2433,6 +3967,7 @@ private:
     return ptr;
   }
 
+  // Create a new MIR function
   void createFunctionDecl(const hir::HIRFunction *hirFunc,
                           std::string overrideName = "",
                           const hir::HIRType *thisType = nullptr) {
@@ -2515,6 +4050,7 @@ private:
     mirModule->addFunction(std::move(mirFunc));
   }
 
+  // Create a new MIR global variable
   void createGlobalDecl(const hir::HIRStmt *stmt) {
     if (auto *varDecl = llvm::dyn_cast_or_null<hir::HIRVarDeclStmt>(stmt)) {
       MIRValue *initVal = nullptr;
@@ -2727,6 +4263,7 @@ private:
     }
   }
 
+  // Coerce a value to a target type
   MIRValue *coerceValue(MIRValue *val, const hir::HIRType *targetTy,
                         SourceLocation loc) {
     if (!val || !targetTy || val->getType() == targetTy)
@@ -2814,7 +4351,8 @@ private:
       MIRValue *f64Val = val;
       if (static_cast<const hir::HIRFloatType *>(val->getType())->getWidth() !=
           64) {
-        f64Val = builder->createBitCast(val, f64Ty, "float.ext", loc);
+        f64Val = builder->insert(std::make_unique<CastInst>(
+            Opcode::FPExt, val, f64Ty, "float.ext", loc));
       }
       MIRValue *outPtr = builder->createAlloca(targetTy, "dec.out", loc);
       MIRValue *scaleVal =
@@ -2865,7 +4403,9 @@ private:
                                              "f64.val", false, loc);
       auto *targetFltTy = static_cast<const hir::HIRFloatType *>(targetTy);
       if (targetFltTy->getWidth() != 64) {
-        return builder->createBitCast(f64Val, targetTy, "float.trunc", loc);
+
+        return builder->insert(std::make_unique<CastInst>(
+            Opcode::FPTrunc, f64Val, targetTy, "float.trunc", loc));
       }
       return f64Val;
     }
@@ -2895,6 +4435,19 @@ private:
           std::make_unique<LoadInst>(castPtr, "dec.reload", loc));
     }
 
+    // FLOAT TO FLOAT
+    if (srcKind == hir::TypeKind::Float && dstKind == hir::TypeKind::Float) {
+      auto *srcFltTy = static_cast<const hir::HIRFloatType *>(val->getType());
+      auto *dstFltTy = static_cast<const hir::HIRFloatType *>(targetTy);
+      if (srcFltTy->getWidth() < dstFltTy->getWidth()) {
+        return builder->insert(std::make_unique<CastInst>(
+            Opcode::FPExt, val, targetTy, "coerce.fpext", loc));
+      } else {
+        return builder->insert(std::make_unique<CastInst>(
+            Opcode::FPTrunc, val, targetTy, "coerce.fptrunc", loc));
+      }
+    }
+
     // INT TO FLOAT
     if (srcKind == hir::TypeKind::Int && dstKind == hir::TypeKind::Float) {
       return builder->insert(std::make_unique<CastInst>(
@@ -2914,6 +4467,7 @@ private:
     lowerFunction(func);
   }
 
+  // Lower a class declaration
   void visitClass(const hir::HIRClass &cls) override {
     for (const auto &method : cls.getMethods()) {
       if (method) {
@@ -2922,6 +4476,7 @@ private:
     }
   }
 
+  // Lower a function declaration
   void lowerFunction(const hir::HIRFunction &func,
                      std::string overrideName = "",
                      const hir::HIRType *thisType = nullptr) {
@@ -2978,29 +4533,53 @@ private:
       const hir::HIRType *rawParamTy = arg->getType();
       if (rawParamTy) {
         std::string tyStr = rawParamTy->toString();
+        bool isARCParam = false;
+
         if (auto *ptrTy =
                 llvm::dyn_cast_or_null<hir::PointerType>(rawParamTy)) {
-          if (ptrTy->getOwnership() == hir::Ownership::Shared)
+          if (ptrTy->getOwnership() == hir::Ownership::Shared) {
             scopeStack.back().refCountedVars.push_back(alloca);
-          else if (ptrTy->getOwnership() != hir::Ownership::Borrowed &&
-                   ptrTy->getOwnership() != hir::Ownership::None) {
+            isARCParam = true;
+          } else if (ptrTy->getOwnership() != hir::Ownership::Borrowed &&
+                     ptrTy->getOwnership() != hir::Ownership::None) {
             scopeStack.back().ownedVars.push_back(alloca);
           }
         } else if (!llvm::dyn_cast_or_null<hir::ReferenceType>(rawParamTy)) {
+          auto k = rawParamTy->getKind();
           if (tyStr.find("Arc<") != std::string::npos ||
-              tyStr.find("shared ") != std::string::npos) {
+              tyStr.find("shared ") != std::string::npos ||
+              k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+              k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+              k == hir::TypeKind::Any || k == hir::TypeKind::Promise) {
+
             scopeStack.back().refCountedVars.push_back(alloca);
+            isARCParam = true;
+
           } else if (tyStr.find("Box<") != std::string::npos ||
-                     rawParamTy->getKind() == hir::TypeKind::Struct ||
-                     rawParamTy->getKind() == hir::TypeKind::Any ||
-                     rawParamTy->getKind() == hir::TypeKind::Closure ||
-                     rawParamTy->getKind() == hir::TypeKind::String ||
-                     rawParamTy->getKind() == hir::TypeKind::Array ||
-                     rawParamTy->getKind() == hir::TypeKind::Map ||
-                     rawParamTy->getKind() == hir::TypeKind::Slice ||
-                     rawParamTy->getKind() == hir::TypeKind::Nullable ||
-                     rawParamTy->getKind() == hir::TypeKind::Promise) {
+                     k == hir::TypeKind::Struct || k == hir::TypeKind::Array ||
+                     k == hir::TypeKind::Nullable) {
             scopeStack.back().ownedVars.push_back(alloca);
+          }
+        }
+
+        if (isARCParam) {
+          bool isClosureType =
+              (rawParamTy->getKind() == hir::TypeKind::Closure ||
+               rawParamTy->toString().find("closure") != std::string::npos ||
+               rawParamTy->toString().find("Closure") != std::string::npos);
+          if (isClosureType) {
+            auto *voidPtrTy =
+                const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                    const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
+                    hir::Ownership::None);
+            MIRValue *envPtr =
+                builder->insert(std::make_unique<ExtractValueInst>(
+                    arg, 1, voidPtrTy, "env.ext", hirParams[i].getLoc()));
+            builder->insert(std::make_unique<ARCInst>(
+                Opcode::Retain, envPtr, nullptr, hirParams[i].getLoc()));
+          } else {
+            builder->insert(std::make_unique<ARCInst>(
+                Opcode::Retain, arg, nullptr, hirParams[i].getLoc()));
           }
         }
       }
@@ -3301,6 +4880,48 @@ private:
                 const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
             auto *zero = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
 
+            size_t baseOffset = 0;
+            if (targetCls) {
+              const hir::HIRClass *c = targetCls;
+              while (!c->getParentTypes().empty()) {
+                std::string pName = c->getParentTypes()[0]->toString();
+                while (!pName.empty() && !isalnum(pName[0]))
+                  pName = pName.substr(1);
+
+                const hir::HIRClass *pCls = nullptr;
+                for (const auto *cls : hirModule->getClasses()) {
+                  std::string clsName = cls->getName();
+                  size_t bPos = clsName.find('<');
+                  if (bPos != std::string::npos)
+                    clsName = clsName.substr(0, bPos);
+
+                  std::string searchName = pName;
+                  size_t pPos = searchName.find('<');
+                  if (pPos != std::string::npos)
+                    searchName = searchName.substr(0, pPos);
+
+                  if (clsName == searchName) {
+                    pCls = cls;
+                    break;
+                  }
+                }
+
+                if (pCls) {
+                  const hir::HIRType *pTy = pCls->getType();
+                  if (auto *ptrTy =
+                          llvm::dyn_cast_or_null<hir::PointerType>(pTy))
+                    pTy = ptrTy->getPointee();
+                  if (auto *pSt =
+                          llvm::dyn_cast_or_null<hir::StructType>(pTy)) {
+                    baseOffset += pSt->getFields().size();
+                  }
+                  c = pCls;
+                } else {
+                  break;
+                }
+              }
+            }
+
             for (size_t i = 0; i < stTy->getFields().size(); ++i) {
               const hir::HIRType *fieldTy = stTy->getFields()[i];
 
@@ -3326,6 +4947,7 @@ private:
                 }
               } else if (fieldTy->getKind() == hir::TypeKind::String ||
                          fieldTy->getKind() == hir::TypeKind::Array ||
+                         fieldTy->getKind() == hir::TypeKind::Slice ||
                          fieldTy->getKind() == hir::TypeKind::Map ||
                          fieldTy->getKind() == hir::TypeKind::Closure ||
                          fieldTy->getKind() == hir::TypeKind::Any ||
@@ -3340,14 +4962,35 @@ private:
                 }
               }
 
-              if (fieldTy->getKind() == hir::TypeKind::Weak ||
-                  fieldTy->toString().find("weak") != std::string::npos) {
+              bool isWeakField = false;
+              const hir::HIRType *weakCheckTy = fieldTy;
+              while (weakCheckTy) {
+                if (weakCheckTy->getKind() == hir::TypeKind::Weak ||
+                    weakCheckTy->toString().find("weak") != std::string::npos) {
+                  isWeakField = true;
+                  break;
+                }
+                if (auto *ptr =
+                        llvm::dyn_cast_or_null<hir::PointerType>(weakCheckTy))
+                  weakCheckTy = ptr->getPointee();
+                else if (auto *ref = llvm::dyn_cast_or_null<hir::ReferenceType>(
+                             weakCheckTy))
+                  weakCheckTy = ref->getInner();
+                else if (auto *nullTy =
+                             llvm::dyn_cast_or_null<hir::HIRNullableType>(
+                                 weakCheckTy))
+                  weakCheckTy = nullTy->getInner();
+                else
+                  break;
+              }
+
+              if (isWeakField) {
                 isManaged = false;
               }
 
               if (isManaged) {
-                auto *idx =
-                    mirModule->getOrInsertConstant<ConstantInt>(i, i32Ty);
+                auto *idx = mirModule->getOrInsertConstant<ConstantInt>(
+                    baseOffset + i, i32Ty);
                 MIRValue *fieldGep = builder->createGEP(
                     loadedThis, {zero, idx}, stTy, "cap.gep", func.getLoc());
 
@@ -3362,19 +5005,19 @@ private:
                 MIRValue *fieldVal =
                     builder->createLoad(fieldGep, "field.load", func.getLoc());
                 std::string dropName = "";
-                const hir::HIRType *baseFieldTy = fieldTy;
+                const hir::HIRType *baseFieldTy = stripMemoryModifiers(fieldTy);
                 while (baseFieldTy) {
                   if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(
                           baseFieldTy)) {
-                    baseFieldTy = pTy->getPointee();
-                  } else if (auto *rTy =
-                                 llvm::dyn_cast_or_null<hir::ReferenceType>(
-                                     baseFieldTy)) {
-                    baseFieldTy = rTy->getInner();
+                    baseFieldTy = stripMemoryModifiers(pTy->getPointee());
                   } else if (auto *nTy =
                                  llvm::dyn_cast_or_null<hir::HIRNullableType>(
                                      baseFieldTy)) {
-                    baseFieldTy = nTy->getInner();
+                    baseFieldTy = stripMemoryModifiers(nTy->getInner());
+                  } else if (auto *rTy =
+                                 llvm::dyn_cast_or_null<hir::ReferenceType>(
+                                     baseFieldTy)) {
+                    baseFieldTy = stripMemoryModifiers(rTy->getInner());
                   } else {
                     break;
                   }
@@ -3383,29 +5026,147 @@ private:
                 if (baseFieldTy &&
                     baseFieldTy->getKind() == hir::TypeKind::Struct) {
                   std::string fName = baseFieldTy->toString();
+
+                  auto removePrefix = [&](const std::string &prefix) {
+                    if (fName.find(prefix) == 0)
+                      fName = fName.substr(prefix.length());
+                  };
+
                   while (!fName.empty() &&
                          (fName[0] == '&' || fName[0] == '*' ||
-                          fName[0] == ' ' || fName[0] == '?'))
+                          fName[0] == ' ' || fName[0] == '?')) {
                     fName = fName.substr(1);
-                  if (fName.find("struct ") == 0)
-                    fName = fName.substr(7);
-                  if (fName.find("class ") == 0)
-                    fName = fName.substr(6);
-                  if (fName.find("Arc<") == 0)
-                    fName = fName.substr(4, fName.length() - 5);
-                  if (fName.find("Box<") == 0)
-                    fName = fName.substr(4, fName.length() - 5);
+                  }
+
+                  removePrefix("shared ");
+                  removePrefix("owned ");
+                  removePrefix("weak ");
+                  removePrefix("mut ");
+                  removePrefix("view ");
+                  removePrefix("lock ");
+                  removePrefix("struct ");
+                  removePrefix("class ");
+
+                  size_t arcPos = fName.find("Arc<");
+                  size_t boxPos = fName.find("Box<");
+                  size_t startPos =
+                      (arcPos != std::string::npos)
+                          ? arcPos
+                          : ((boxPos != std::string::npos) ? boxPos
+                                                           : std::string::npos);
+                  if (startPos != std::string::npos) {
+                    fName = fName.substr(startPos + 4);
+                    size_t endPos = fName.rfind(">");
+                    if (endPos != std::string::npos)
+                      fName = fName.substr(0, endPos);
+                  }
+
                   if (!fName.empty() && fName.back() == '?')
                     fName.pop_back();
 
                   dropName = fName + ".destructor_ret_void";
+                } else if (baseFieldTy &&
+                           baseFieldTy->getKind() == hir::TypeKind::Map) {
+                  dropName = getOrCreateMapDestructor(baseFieldTy)->getName();
+                } else if (baseFieldTy &&
+                           (baseFieldTy->getKind() == hir::TypeKind::Slice ||
+                            baseFieldTy->getKind() == hir::TypeKind::Array)) {
+                  dropName = getOrCreateArrayDestructor(baseFieldTy)->getName();
+                } else if (baseFieldTy &&
+                           baseFieldTy->getKind() == hir::TypeKind::Any) {
+                  dropName = getOrCreateAnyDestructor()->getName();
                 }
 
                 MIRFunction *dropFunc = dropName.empty()
                                             ? nullptr
                                             : mirModule->getFunction(dropName);
-                builder->insert(std::make_unique<ARCInst>(
-                    Opcode::Release, fieldVal, dropFunc, func.getLoc()));
+
+                bool isStructLike = false;
+                const hir::HIRType *actualFieldTy =
+                    stripMemoryModifiers(fieldTy);
+                if (actualFieldTy &&
+                    actualFieldTy->getKind() != hir::TypeKind::Pointer &&
+                    actualFieldTy->getKind() != hir::TypeKind::Reference &&
+                    actualFieldTy->getKind() != hir::TypeKind::Nullable) {
+                  isStructLike =
+                      (actualFieldTy->getKind() == hir::TypeKind::Any ||
+                       actualFieldTy->getKind() == hir::TypeKind::Array ||
+                       actualFieldTy->getKind() == hir::TypeKind::Struct ||
+                       actualFieldTy->getKind() == hir::TypeKind::Closure ||
+                       actualFieldTy->toString().find("closure") !=
+                           std::string::npos ||
+                       actualFieldTy->toString().find("Closure.") !=
+                           std::string::npos);
+                }
+
+                if (isStructLike) {
+                  if (baseFieldTy->getKind() == hir::TypeKind::Closure ||
+                      baseFieldTy->toString().find("closure") !=
+                          std::string::npos ||
+                      baseFieldTy->toString().find("Closure.") !=
+                          std::string::npos) {
+                    auto *voidPtrTy =
+                        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                            const_cast<hir::HIRModule *>(hirModule)
+                                ->getVoidType(),
+                            hir::Ownership::None);
+                    MIRValue *envPtr =
+                        builder->insert(std::make_unique<ExtractValueInst>(
+                            fieldVal, 1, voidPtrTy, "env.ext", func.getLoc()));
+                    std::string relName = "moksha_rt_release_closure_env";
+                    ensureBuiltinMIR(relName);
+                    MIRFunction *relFunc = mirModule->getFunction(relName);
+                    if (!relFunc) {
+                      auto fn = std::make_unique<MIRFunction>(
+                          const_cast<hir::HIRModule *>(hirModule)
+                              ->getVoidType(),
+                          relName, Linkage::External);
+                      fn->addArgument(std::make_unique<MIRArgument>(
+                          fn.get(), voidPtrTy, 0));
+                      relFunc = fn.get();
+                      mirModule->addFunction(std::move(fn));
+                    }
+                    builder->insert(std::make_unique<CallInst>(
+                        relFunc, std::vector<MIRValue *>{envPtr},
+                        const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
+                        "", false, func.getLoc()));
+                  } else if (dropFunc) {
+                    MIRValue *argVal = fieldGep;
+                    if (!dropFunc->getRawArguments().empty()) {
+                      const hir::HIRType *expectedTy =
+                          dropFunc->getRawArguments()[0]->getType();
+                      if (argVal->getType() != expectedTy) {
+                        argVal = builder->createBitCast(
+                            argVal, expectedTy, "drop.cast", func.getLoc());
+                      }
+                    }
+                    auto *voidRetTy =
+                        const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+                    builder->insert(std::make_unique<CallInst>(
+                        dropFunc, std::vector<MIRValue *>{argVal}, voidRetTy,
+                        "", false, func.getLoc()));
+                  }
+                } else {
+                  builder->insert(std::make_unique<ARCInst>(
+                      Opcode::Release, fieldVal, dropFunc, func.getLoc()));
+                }
+              } else if (isWeakField) {
+                auto *idx =
+                    mirModule->getOrInsertConstant<ConstantInt>(i, i32Ty);
+                MIRValue *fieldGep = builder->createGEP(
+                    loadedThis, {zero, idx}, stTy, "weak.gep", func.getLoc());
+
+                auto *expectedPtrTy =
+                    const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                        fieldTy, hir::Ownership::None);
+                if (fieldGep->getType() != expectedPtrTy) {
+                  fieldGep = builder->createBitCast(
+                      fieldGep, expectedPtrTy, "weak.gep.cast", func.getLoc());
+                }
+
+                MIRValue *nullVal =
+                    mirModule->getOrInsertConstant<ConstantNull>(fieldTy);
+                builder->createStoreWeak(nullVal, fieldGep, func.getLoc());
               }
             }
           }
@@ -3813,12 +5574,15 @@ private:
     MIRValue *pinnedCollection = collection;
     MIRValue *keepAliveAlloca = nullptr;
     if (needsRetain && collection) {
-      keepAliveAlloca = builder->createAlloca(collection->getType(),
-                                              "forin.keepalive", stmt.getLoc());
+      keepAliveAlloca = createHoistedAlloca(collection->getType(),
+                                            "forin.keepalive", stmt.getLoc());
       builder->insert(std::make_unique<ARCInst>(Opcode::Retain, collection,
                                                 nullptr, stmt.getLoc()));
       builder->insert(std::make_unique<StoreInst>(collection, keepAliveAlloca,
                                                   stmt.getLoc()));
+      if (!scopeStack.empty()) {
+        scopeStack.back().refCountedVars.push_back(keepAliveAlloca);
+      }
     }
 
     MIRValue *valLoopVar = nullptr;
@@ -3832,22 +5596,45 @@ private:
         targetVarTy =
             const_cast<hir::HIRModule *>(hirModule)->getIntType(8, true);
       }
-      valLoopVar = builder->createAlloca(targetVarTy, valDecl->getName(),
-                                         valDecl->getLoc());
+      valLoopVar = createHoistedAlloca(targetVarTy, valDecl->getName(),
+                                       valDecl->getLoc());
       symbolMap[valDecl->getName()] = valLoopVar;
+      MIRValue *nullVal =
+          mirModule->getOrInsertConstant<ConstantNull>(targetVarTy);
+      builder->insert(
+          std::make_unique<StoreInst>(nullVal, valLoopVar, stmt.getLoc()));
+      if (targetVarTy->getKind() == hir::TypeKind::String ||
+          targetVarTy->getKind() == hir::TypeKind::Any ||
+          targetVarTy->getKind() == hir::TypeKind::Map ||
+          targetVarTy->getKind() == hir::TypeKind::Slice ||
+          targetVarTy->toString().find("Arc<") != std::string::npos) {
+        scopeStack.back().ownedVars.push_back(valLoopVar);
+      }
     }
 
     if (auto *idxDecl = stmt.getIndexVariable()) {
       targetIdxTy = idxDecl->getType();
-      idxLoopVar = builder->createAlloca(targetIdxTy, idxDecl->getName(),
-                                         idxDecl->getLoc());
+      idxLoopVar = createHoistedAlloca(targetIdxTy, idxDecl->getName(),
+                                       idxDecl->getLoc());
       symbolMap[idxDecl->getName()] = idxLoopVar;
+      MIRValue *nullVal =
+          mirModule->getOrInsertConstant<ConstantNull>(targetIdxTy);
+      builder->insert(
+          std::make_unique<StoreInst>(nullVal, idxLoopVar, stmt.getLoc()));
+
+      if (targetIdxTy->getKind() == hir::TypeKind::String ||
+          targetIdxTy->getKind() == hir::TypeKind::Any ||
+          targetIdxTy->getKind() == hir::TypeKind::Map ||
+          targetIdxTy->getKind() == hir::TypeKind::Slice ||
+          targetIdxTy->toString().find("Arc<") != std::string::npos) {
+        scopeStack.back().ownedVars.push_back(idxLoopVar);
+      }
     }
 
     auto *intType =
         const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
     MIRValue *indexAlloca =
-        builder->createAlloca(intType, "forin.idx", stmt.getLoc());
+        createHoistedAlloca(intType, "forin.idx", stmt.getLoc());
     MIRValue *zero = mirModule->getOrInsertConstant<ConstantInt>(0, intType);
     builder->insert(
         std::make_unique<StoreInst>(zero, indexAlloca, stmt.getLoc()));
@@ -3962,23 +5749,53 @@ private:
       }
 
       if (idxLoopVar) {
-        std::string iterValName = "moksha_rt_map_get_val_at";
-        ensureBuiltinMIR(iterValName);
-        MIRFunction *iterValFunc = mirModule->getFunction(iterValName);
-        if (!iterValFunc) {
-          auto fn = std::make_unique<MIRFunction>(abiAnyTy, iterValName,
-                                                  Linkage::External);
-          fn->addArgument(
-              std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
-          fn->addArgument(std::make_unique<MIRArgument>(fn.get(), intType, 1));
-          iterValFunc = fn.get();
-          mirModule->addFunction(std::move(fn));
+        bool isTargetRef = false;
+        if (targetVarTy && targetVarTy->getKind() == hir::TypeKind::Pointer) {
+          if (auto *ptrTy =
+                  static_cast<const hir::PointerType *>(targetVarTy)) {
+            if (ptrTy->getOwnership() == hir::Ownership::Borrowed) {
+              isTargetRef = true;
+            }
+          }
         }
-        mapVal =
-            builder->createCall(iterValFunc, {castedMap, currentIndex},
-                                abiAnyTy, "map.val.ptr", false, stmt.getLoc());
-        if (abiAnyTy != anyTy) {
-          mapVal = builder->createLoad(mapVal, "map.val", stmt.getLoc());
+
+        if (isTargetRef) {
+          std::string iterValName = "moksha_rt_map_get_val_ptr_at";
+          ensureBuiltinMIR(iterValName);
+          MIRFunction *iterValFunc = mirModule->getFunction(iterValName);
+          if (!iterValFunc) {
+            auto fn = std::make_unique<MIRFunction>(voidPtrTy, iterValName,
+                                                    Linkage::External);
+            fn->addArgument(
+                std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+            fn->addArgument(
+                std::make_unique<MIRArgument>(fn.get(), intType, 1));
+            iterValFunc = fn.get();
+            mirModule->addFunction(std::move(fn));
+          }
+          mapVal = builder->createCall(iterValFunc, {castedMap, currentIndex},
+                                       voidPtrTy, "map.val.ptr", false,
+                                       stmt.getLoc());
+        } else {
+          std::string iterValName = "moksha_rt_map_get_val_at";
+          ensureBuiltinMIR(iterValName);
+          MIRFunction *iterValFunc = mirModule->getFunction(iterValName);
+          if (!iterValFunc) {
+            auto fn = std::make_unique<MIRFunction>(abiAnyTy, iterValName,
+                                                    Linkage::External);
+            fn->addArgument(
+                std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+            fn->addArgument(
+                std::make_unique<MIRArgument>(fn.get(), intType, 1));
+            iterValFunc = fn.get();
+            mirModule->addFunction(std::move(fn));
+          }
+          mapVal = builder->createCall(iterValFunc, {castedMap, currentIndex},
+                                       abiAnyTy, "map.val.ptr", false,
+                                       stmt.getLoc());
+          if (abiAnyTy != anyTy) {
+            mapVal = builder->createLoad(mapVal, "map.val", stmt.getLoc());
+          }
         }
       }
     }
@@ -4064,10 +5881,23 @@ private:
         MIRValue *gep = nullptr;
         gep = builder->createGEP(dataPtr, {currentIndex}, trueElemTy,
                                  "elem.ptr", stmt.getLoc());
-
         elemAddr = gep;
-        loadedElem = builder->insert(
-            std::make_unique<LoadInst>(gep, "elem.val", stmt.getLoc()));
+        bool isTargetRef = false;
+        if (targetVarTy && targetVarTy->getKind() == hir::TypeKind::Pointer) {
+          if (auto *ptrTy =
+                  static_cast<const hir::PointerType *>(targetVarTy)) {
+            if (ptrTy->getOwnership() == hir::Ownership::Borrowed) {
+              isTargetRef = true;
+            }
+          }
+        }
+
+        if (isTargetRef) {
+          loadedElem = elemAddr;
+        } else {
+          loadedElem = builder->insert(
+              std::make_unique<LoadInst>(gep, "elem.val", stmt.getLoc()));
+        }
       }
 
       if (trueElemTy != targetVarTy || loadedElem->getType() != targetVarTy) {
@@ -4099,6 +5929,31 @@ private:
         }
       }
 
+      if (targetVarTy->getKind() == hir::TypeKind::String ||
+          targetVarTy->getKind() == hir::TypeKind::Any ||
+          targetVarTy->getKind() == hir::TypeKind::Map ||
+          targetVarTy->getKind() == hir::TypeKind::Slice ||
+          targetVarTy->toString().find("Arc<") != std::string::npos) {
+
+        builder->insert(std::make_unique<ARCInst>(Opcode::Retain, loadedElem,
+                                                  nullptr, stmt.getLoc()));
+
+        if (targetVarTy->getKind() == hir::TypeKind::Any) {
+          MIRFunction *anyDtor = getOrCreateAnyDestructor();
+          auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+          MIRValue *castPtr = builder->createBitCast(
+              valLoopVar, anyDtor->getRawArguments()[0]->getType(), "dtor.cast",
+              stmt.getLoc());
+          builder->insert(std::make_unique<CallInst>(
+              anyDtor, std::vector<MIRValue *>{castPtr}, voidTy, "", false,
+              stmt.getLoc()));
+        } else {
+          MIRValue *oldIterVal =
+              builder->createLoad(valLoopVar, "iter.old.val", stmt.getLoc());
+          builder->insert(std::make_unique<ARCInst>(Opcode::Release, oldIterVal,
+                                                    nullptr, stmt.getLoc()));
+        }
+      }
       builder->insert(
           std::make_unique<StoreInst>(loadedElem, valLoopVar, stmt.getLoc()));
     }
@@ -4110,15 +5965,42 @@ private:
       }
       if (targetIdxTy != targetIndex->getType()) {
         if (targetIdxTy->getKind() == hir::TypeKind::Any) {
-          ensureStringifierForAny(targetIndex->getType());
-          targetIndex = builder->insert(std::make_unique<CastInst>(
-              Opcode::AnyCast, targetIndex, targetIdxTy, "idx.anycast",
-              stmt.getLoc()));
+          targetIndex = emitExplicitAnyBox(targetIndex, targetIndex->getType(),
+                                           stmt.getLoc());
+        } else if (targetIndex->getType()->getKind() == hir::TypeKind::Any) {
+          targetIndex = unboxValue(targetIndex, targetIndex->getType(),
+                                   targetIdxTy, stmt.getLoc());
         } else {
           targetIndex = builder->createBitCast(targetIndex, targetIdxTy,
                                                "idx.cast", stmt.getLoc());
         }
       }
+
+      if (targetIdxTy->getKind() == hir::TypeKind::String ||
+          targetIdxTy->getKind() == hir::TypeKind::Any ||
+          targetIdxTy->getKind() == hir::TypeKind::Map ||
+          targetIdxTy->getKind() == hir::TypeKind::Slice ||
+          targetIdxTy->toString().find("Arc<") != std::string::npos) {
+
+        builder->insert(std::make_unique<ARCInst>(Opcode::Retain, targetIndex,
+                                                  nullptr, stmt.getLoc()));
+        if (targetIdxTy->getKind() == hir::TypeKind::Any) {
+          MIRFunction *anyDtor = getOrCreateAnyDestructor();
+          auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+          MIRValue *castPtr = builder->createBitCast(
+              idxLoopVar, anyDtor->getRawArguments()[0]->getType(), "dtor.cast",
+              stmt.getLoc());
+          builder->insert(std::make_unique<CallInst>(
+              anyDtor, std::vector<MIRValue *>{castPtr}, voidTy, "", false,
+              stmt.getLoc()));
+        } else {
+          MIRValue *oldIterIdx =
+              builder->createLoad(idxLoopVar, "iter.old.idx", stmt.getLoc());
+          builder->insert(std::make_unique<ARCInst>(Opcode::Release, oldIterIdx,
+                                                    nullptr, stmt.getLoc()));
+        }
+      }
+
       builder->insert(
           std::make_unique<StoreInst>(targetIndex, idxLoopVar, stmt.getLoc()));
     }
@@ -4163,14 +6045,6 @@ private:
     builder->createBr(condBlock);
     builder->setInsertPoint(endBlock);
     symbolMap = oldSymbolMap;
-
-    if (needsRetain && keepAliveAlloca) {
-      MIRValue *loadedKeepAlive = builder->insert(std::make_unique<LoadInst>(
-          keepAliveAlloca, "keepalive.load", stmt.getLoc()));
-
-      builder->insert(std::make_unique<ARCInst>(
-          Opcode::Release, loadedKeepAlive, nullptr, stmt.getLoc()));
-    }
     lastExprValue = nullptr;
   }
 
@@ -4714,6 +6588,8 @@ private:
             typeId = 17;
           else if (coreTy->getKind() == hir::TypeKind::Array)
             typeId = 18;
+          else if (coreTy->getKind() == hir::TypeKind::Array)
+            typeId = 19;
 
           std::string getTypeName = "__moksha_get_type";
           ensureBuiltinMIR(getTypeName);
@@ -4771,11 +6647,8 @@ private:
           const hir::HIRType *catchType =
               catchClause.varType ? catchClause.varType : voidPtrTy;
 
-          auto *alloca = builder->createAlloca(catchType, catchClause.varName,
-                                               catchClause.loc);
-          symbolMap[catchClause.varName] = alloca;
+          // Unbox the payload pointer
           MIRValue *valToStore = consumedEx;
-
           if (catchType->getKind() == hir::TypeKind::Pointer ||
               catchType->getKind() == hir::TypeKind::Reference) {
             if (consumedEx->getType() != catchType) {
@@ -4794,8 +6667,62 @@ private:
                 typedPtr, "ex.unboxed", catchClause.loc));
           }
 
-          builder->insert(
-              std::make_unique<StoreInst>(valToStore, alloca, catchClause.loc));
+          // Evaluate if it's an ARC/Owned type
+          bool isARC = false;
+          bool isOwned = false;
+          const hir::HIRType *checkTy = stripMemoryModifiers(catchType);
+          if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+            if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+                ptrTy->getOwnership() == hir::Ownership::Owned ||
+                ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+              isARC = true;
+            }
+          } else if (auto *refTy =
+                         llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+            if (refTy->getOwnership() == hir::Ownership::Shared ||
+                refTy->getOwnership() == hir::Ownership::Owned ||
+                refTy->getInner()->getKind() == hir::TypeKind::Any) {
+              isARC = true;
+            }
+          } else if (checkTy) {
+            auto k = checkTy->getKind();
+            if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+                k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+                k == hir::TypeKind::Any || k == hir::TypeKind::Promise ||
+                checkTy->toString().find("Arc<") != std::string::npos ||
+                checkTy->toString().find("Box<") != std::string::npos) {
+              isARC = true;
+            } else if (k == hir::TypeKind::Struct ||
+                       k == hir::TypeKind::Array) {
+              isOwned = true;
+            }
+          }
+
+          auto *payloadCleanupAlloca = builder->createAlloca(
+              catchType, "ex.payload.cleanup", catchClause.loc);
+          builder->insert(std::make_unique<StoreInst>(
+              valToStore, payloadCleanupAlloca, catchClause.loc));
+          if (isARC) {
+            scopeStack.back().refCountedVars.push_back(payloadCleanupAlloca);
+          } else if (isOwned) {
+            scopeStack.back().ownedVars.push_back(payloadCleanupAlloca);
+          }
+
+          if (!catchClause.varName.empty()) {
+            auto *userAlloca = builder->createAlloca(
+                catchType, catchClause.varName, catchClause.loc);
+            symbolMap[catchClause.varName] = userAlloca;
+            builder->insert(std::make_unique<StoreInst>(valToStore, userAlloca,
+                                                        catchClause.loc));
+
+            if (isARC) {
+              builder->insert(std::make_unique<ARCInst>(
+                  Opcode::Retain, valToStore, nullptr, catchClause.loc));
+              scopeStack.back().refCountedVars.push_back(userAlloca);
+            } else if (isOwned) {
+              scopeStack.back().ownedVars.push_back(userAlloca);
+            }
+          }
         } else {
           auto *alloca =
               builder->createAlloca(voidPtrTy, "dummy.ex", catchClause.loc);
@@ -4860,6 +6787,28 @@ private:
         exVal->getType()->getKind() == hir::TypeKind::Reference) {
       boxedEx =
           builder->createBitCast(exVal, voidPtrTy, "throw.cast", stmt.getLoc());
+
+      bool typeIsARC = false;
+      const hir::HIRType *checkTy = stripMemoryModifiers(exVal->getType());
+      if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+        if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+            ptrTy->getOwnership() == hir::Ownership::Owned ||
+            ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+      } else if (auto *refTy =
+                     llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+        if (refTy->getOwnership() == hir::Ownership::Shared ||
+            refTy->getOwnership() == hir::Ownership::Owned ||
+            refTy->getInner()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+      }
+      if (typeIsARC) {
+        builder->insert(std::make_unique<ARCInst>(Opcode::Retain, exVal,
+                                                  nullptr, stmt.getLoc()));
+      }
+
     } else {
       auto *i32Ty =
           const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
@@ -4920,8 +6869,10 @@ private:
         typeId = 16;
       else if (coreTy->getKind() == hir::TypeKind::Map)
         typeId = 17;
-      else if (coreTy->getKind() == hir::TypeKind::Array)
+      else if (coreTy->getKind() == hir::TypeKind::Slice)
         typeId = 18;
+      else if (coreTy->getKind() == hir::TypeKind::Array)
+        typeId = 19;
 
       MIRValue *typeIdVal =
           mirModule->getOrInsertConstant<ConstantInt>(typeId, i32Ty);
@@ -4935,6 +6886,7 @@ private:
           boxedEx, typedPtrTy, "throw.typed_ptr", stmt.getLoc());
       builder->insert(
           std::make_unique<StoreInst>(exVal, typedBoxPtr, stmt.getLoc()));
+      emitDeepRetain(typedBoxPtr, exVal->getType(), false, stmt.getLoc());
     }
 
     builder->insert(std::make_unique<StoreInst>(
@@ -5102,8 +7054,8 @@ private:
     MIRValue *initVal = nullptr;
     if (varDecl->getInit()) {
       expectedLambdaReturnType = varDecl->getType();
+
       visit(varDecl->getInit());
-      expectedLambdaReturnType = nullptr;
       initVal = lastExprValue;
     }
 
@@ -5122,11 +7074,100 @@ private:
     const hir::HIRType *actualType = resolveType(varDecl->getType());
     const hir::HIRType *rawType = varDecl->getType();
 
+    const hir::HIRType *coreRawTy = rawType;
+    while (coreRawTy) {
+      if (auto *mutTy = llvm::dyn_cast_or_null<hir::HIRMutType>(coreRawTy))
+        coreRawTy = mutTy->getInner();
+      else if (auto *viewTy =
+                   llvm::dyn_cast_or_null<hir::HIRViewType>(coreRawTy))
+        coreRawTy = viewTy->getInner();
+      else if (auto *lockTy =
+                   llvm::dyn_cast_or_null<hir::HIRLockType>(coreRawTy))
+        coreRawTy = lockTy->getInner();
+      else
+        break;
+    }
+
     bool isManagedTarget = false;
-    if (rawType && rawType->getKind() == hir::TypeKind::Pointer) {
-      auto own = static_cast<const hir::PointerType *>(rawType)->getOwnership();
+    if (coreRawTy && coreRawTy->getKind() == hir::TypeKind::Pointer) {
+      auto own =
+          static_cast<const hir::PointerType *>(coreRawTy)->getOwnership();
       if (own == hir::Ownership::Shared || own == hir::Ownership::Owned) {
         isManagedTarget = true;
+      }
+    }
+
+    bool typeIsARC = isManagedTarget;
+    if (rawType) {
+      const hir::HIRType *checkTy = stripMemoryModifiers(rawType);
+      if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+        if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+            ptrTy->getOwnership() == hir::Ownership::Owned ||
+            ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+      } else if (auto *refTy =
+                     llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+        if (refTy->getOwnership() == hir::Ownership::Shared ||
+            refTy->getOwnership() == hir::Ownership::Owned ||
+            refTy->getInner()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+      } else {
+        if (auto *nullTy =
+                llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+          checkTy = stripMemoryModifiers(nullTy->getInner());
+        }
+        if (checkTy) {
+          auto k = checkTy->getKind();
+          if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+              k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+              k == hir::TypeKind::Function || k == hir::TypeKind::Any ||
+              k == hir::TypeKind::Promise ||
+              checkTy->toString().find("Arc<") != std::string::npos ||
+              checkTy->toString().find("Box<") != std::string::npos ||
+              checkTy->toString().find("closure") != std::string::npos) {
+            typeIsARC = true;
+          }
+          if (checkTy->toString().find("Closure.lambda.") !=
+              std::string::npos) {
+            typeIsARC = false;
+          }
+          if (!typeIsARC) {
+            std::string cName = checkTy->toString();
+            while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
+                                      cName[0] == ' ' || cName[0] == '?'))
+              cName = cName.substr(1);
+            if (cName.find("struct.") == 0)
+              cName = cName.substr(7);
+            if (cName.find("class.") == 0)
+              cName = cName.substr(6);
+            for (const auto *cls : hirModule->getClasses()) {
+              if (cls->getName() == cName ||
+                  cName.find(cls->getName() + "<") == 0) {
+                bool isRef = false;
+                const hir::HIRType *clsTy = cls->getType();
+                if (auto *pTy =
+                        llvm::dyn_cast_or_null<hir::PointerType>(clsTy)) {
+                  isRef = true;
+                  clsTy = pTy->getPointee();
+                } else if (auto *rTy =
+                               llvm::dyn_cast_or_null<hir::ReferenceType>(
+                                   clsTy)) {
+                  isRef = true;
+                  clsTy = rTy->getInner();
+                }
+                if (auto *st = llvm::dyn_cast_or_null<hir::StructType>(clsTy)) {
+                  if (st->isRefClass())
+                    isRef = true;
+                }
+                if (isRef || cls->hasVTable())
+                  typeIsARC = true;
+                break;
+              }
+            }
+          }
+        }
       }
     }
 
@@ -5162,11 +7203,6 @@ private:
             cFloat->getValue(), actualType);
       } else if (llvm::dyn_cast_or_null<ConstantNull>(initVal)) {
         valToStore = mirModule->getOrInsertConstant<ConstantNull>(actualType);
-      } else if (actualType->getKind() == hir::TypeKind::Any) {
-        valToStore = builder->insert(
-            std::make_unique<CastInst>(Opcode::AnyCast, initVal, actualType,
-                                       "init.any", varDecl->getLoc()));
-        applyBorrowKind(valToStore, actualType);
       } else {
         bool isDestStruct = actualType->getKind() == hir::TypeKind::Struct;
         bool isSrcPtr =
@@ -5213,8 +7249,6 @@ private:
     uint64_t explicitAlign = varDecl->getAlignment();
     if (explicitAlign == 0 && rawType) {
       const hir::HIRType *baseAlignTy = rawType;
-
-      // Unwrap Arrays, Pointers, and References to find the core struct
       while (baseAlignTy) {
         if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(baseAlignTy)) {
           baseAlignTy = pTy->getPointee();
@@ -5280,6 +7314,101 @@ private:
       if (isWeakMemory(rawType)) {
         builder->createStoreWeak(valToStore, alloca, varDecl->getLoc());
       } else {
+        bool isTemporary = false;
+        bool isFreshAllocation = false;
+
+        // UNCONDITIONALLY trace and steal ownership for ALL types (Arrays,
+        // Structs, ARC, etc.)
+        if (valToStore->getType()->getKind() != hir::TypeKind::Null) {
+          MIRValue *traceFresh = valToStore;
+          while (traceFresh) {
+            if (auto *c = llvm::dyn_cast_or_null<CastInst>(traceFresh)) {
+              traceFresh = c->getValue();
+            } else if (auto *loadInst =
+                           llvm::dyn_cast_or_null<LoadInst>(traceFresh)) {
+              if (loadInst->getName().find("new.") == 0) {
+                isFreshAllocation = true;
+              }
+              traceFresh = loadInst->getPointer();
+            } else if (auto *allocaInst =
+                           llvm::dyn_cast_or_null<AllocaInst>(traceFresh)) {
+              std::string name = allocaInst->getName();
+              if (name.find("temp.arc.alloca") != std::string::npos ||
+                  name.find("box.temp.alloca") != std::string::npos ||
+                  name.find("str.temp.tracked") != std::string::npos ||
+                  name.find("any.box.stack") != std::string::npos ||
+                  name.find("rt.out.spill") != std::string::npos) {
+                for (int i = scopeStack.size() - 1; i >= 0; --i) {
+                  auto &shared = scopeStack[i].refCountedVars;
+                  auto it = std::find(shared.begin(), shared.end(), allocaInst);
+                  if (it != shared.end()) {
+                    shared.erase(it); // Steal ownership
+                    isTemporary = true;
+                    break;
+                  }
+                }
+              } else if (name.find("array.raw.stack") != std::string::npos ||
+                         name.find("new.obj.stack") != std::string::npos) {
+                for (int j = scopeStack.size() - 1; j >= 0; --j) {
+                  auto &owned = scopeStack[j].ownedVars;
+                  auto it = std::find(owned.begin(), owned.end(), allocaInst);
+                  if (it != owned.end()) {
+                    owned.erase(it);
+                    isTemporary = true;
+                    break;
+                  }
+                }
+                isFreshAllocation = true;
+              }
+              break;
+            } else if (auto *call =
+                           llvm::dyn_cast_or_null<CallInst>(traceFresh)) {
+              if (call->returnsOwned()) {
+                isFreshAllocation = true;
+              } else if (call->getCallee()) {
+                std::string cName = call->getCallee()->getName();
+                if (cName.find("alloc") != std::string::npos ||
+                    cName.find("string") != std::string::npos ||
+                    cName.find("map_new") != std::string::npos) {
+                  isFreshAllocation = true;
+                }
+              }
+              break;
+            } else if (auto *inv =
+                           llvm::dyn_cast_or_null<InvokeInst>(traceFresh)) {
+              if (inv->returnsOwned()) {
+                isFreshAllocation = true;
+              } else if (inv->getCallee()) {
+                std::string cName = inv->getCallee()->getName();
+                if (cName.find("alloc") != std::string::npos ||
+                    cName.find("string") != std::string::npos ||
+                    cName.find("map_new") != std::string::npos) {
+                  isFreshAllocation = true;
+                }
+              }
+              break;
+            } else if (llvm::isa<MakeClosureInst>(traceFresh)) {
+              isFreshAllocation = true;
+              break;
+            } else if (llvm::isa<LoadWeakInst>(traceFresh)) {
+              isFreshAllocation = true;
+              break;
+            } else {
+              break;
+            }
+          }
+        }
+
+        // Only emit ARC Retain instructions for actual ARC heap pointers
+        if (typeIsARC &&
+            valToStore->getType()->getKind() != hir::TypeKind::Null) {
+          // Safely skip the retain if the value already carries a +1 ref count
+          if (!isTemporary && !isFreshAllocation) {
+            builder->insert(std::make_unique<ARCInst>(
+                Opcode::Retain, valToStore, nullptr, varDecl->getLoc()));
+          }
+        }
+
         builder->insert(
             std::make_unique<StoreInst>(valToStore, alloca, varDecl->getLoc()));
         if (isVolatilePointer(valToStore)) {
@@ -5293,67 +7422,23 @@ private:
     }
 
     if (!scopeStack.empty() && rawType) {
-      bool isShared = false;
-      bool isOwned = false;
-
-      if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(rawType)) {
-        if (ptrTy->getOwnership() == hir::Ownership::Shared) {
-          isShared = true;
-        } else if (ptrTy->getOwnership() == hir::Ownership::Owned ||
-                   ptrTy->getOwnership() == hir::Ownership::None) {
-          if (ptrTy->getPointee() &&
-              ptrTy->getPointee()->getKind() == hir::TypeKind::Struct) {
-
-            if (ptrTy->getOwnership() == hir::Ownership::Owned) {
-              isOwned = true;
-            } else {
-              MIRValue *trace = initVal;
-              while (auto *cast = llvm::dyn_cast_or_null<CastInst>(trace)) {
-                trace = cast->getValue();
-              }
-              if (auto *call = llvm::dyn_cast_or_null<CallInst>(trace)) {
-                if (call->getCallee() &&
-                    call->getCallee()->getName() == "__moksha_alloc") {
-                  isOwned = true;
-                }
-              } else if (auto *invoke =
-                             llvm::dyn_cast_or_null<InvokeInst>(trace)) {
-                if (invoke->getCallee() &&
-                    invoke->getCallee()->getName() == "__moksha_alloc") {
-                  isOwned = true;
-                }
-              }
-            }
+      if (isWeakMemory(rawType)) {
+        scopeStack.back().ownedVars.push_back(alloca);
+      } else if (typeIsARC) {
+        scopeStack.back().refCountedVars.push_back(alloca);
+      } else {
+        const hir::HIRType *checkTy = stripMemoryModifiers(rawType);
+        if (auto *nullTy =
+                llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+          checkTy = stripMemoryModifiers(nullTy->getInner());
+        }
+        if (checkTy) {
+          auto k = checkTy->getKind();
+          if (k == hir::TypeKind::Struct || k == hir::TypeKind::Array ||
+              k == hir::TypeKind::Closure) {
+            scopeStack.back().ownedVars.push_back(alloca);
           }
         }
-      } else if (llvm::dyn_cast_or_null<hir::ReferenceType>(rawType)) {
-        // References are always borrowed, do nothing.
-      } else {
-        std::string tyStr = rawType->toString();
-        if (tyStr.find("Arc<") != std::string::npos ||
-            tyStr.find("shared ") != std::string::npos) {
-          isShared = true;
-        } else if (tyStr.find("Box<") != std::string::npos ||
-                   tyStr.find("owned ") != std::string::npos) {
-          isOwned = true;
-        } else if (rawType->getKind() == hir::TypeKind::Struct ||
-                   rawType->getKind() == hir::TypeKind::Closure ||
-                   rawType->getKind() == hir::TypeKind::Any ||
-                   rawType->getKind() == hir::TypeKind::String ||
-                   rawType->getKind() == hir::TypeKind::Array ||
-                   rawType->getKind() == hir::TypeKind::Slice ||
-                   rawType->getKind() == hir::TypeKind::Map ||
-                   rawType->getKind() == hir::TypeKind::Nullable ||
-                   rawType->getKind() == hir::TypeKind::Promise ||
-                   tyStr.find("closure") != std::string::npos) {
-          isOwned = true;
-        }
-      }
-
-      if (isShared) {
-        scopeStack.back().refCountedVars.push_back(alloca);
-      } else if (isOwned) {
-        scopeStack.back().ownedVars.push_back(alloca);
       }
     }
   }
@@ -5382,33 +7467,24 @@ private:
 
           auto prepareAnyPtr =
               [&](MIRValue *val, const hir::HIRType *expectedTy) -> MIRValue * {
-            if (expectedTy->getKind() == hir::TypeKind::Int &&
-                val->getType() != expectedTy) {
-              if (llvm::isa<ConstantInt>(val)) {
-                val = mirModule->getOrInsertConstant<ConstantInt>(
-                    static_cast<ConstantInt *>(val)->getValue(), expectedTy);
-              } else {
-                val = builder->createBitCast(val, expectedTy, "map.force.cast",
-                                             expr.getLoc());
-              }
-            }
-
+            MIRValue *boxPtr = val;
             if (val->getType()->getKind() != hir::TypeKind::Any) {
-              val = boxValue(val, expectedTy, anyTy, expr.getLoc());
+              boxPtr = boxValue(val, val->getType(), anyTy, expr.getLoc());
             }
 
-            if (val->getType()->getKind() != hir::TypeKind::Pointer) {
+            if (boxPtr->getType() == anyTy) {
               auto *spill =
-                  builder->createAlloca(anyTy, "map.any.spill", expr.getLoc());
+                  createHoistedAlloca(anyTy, "map.any.spill", expr.getLoc());
               builder->insert(
-                  std::make_unique<StoreInst>(val, spill, expr.getLoc()));
-              val = spill;
+                  std::make_unique<StoreInst>(boxPtr, spill, expr.getLoc()));
+              boxPtr = spill;
             }
-            if (val->getType() != anyPtrTy) {
-              val = builder->createBitCast(val, anyPtrTy, "map.any.cast",
-                                           expr.getLoc());
+
+            if (boxPtr->getType() != anyPtrTy) {
+              boxPtr = builder->createBitCast(boxPtr, anyPtrTy, "map.any.cast",
+                                              expr.getLoc());
             }
-            return val;
+            return boxPtr;
           };
 
           MIRValue *lvalueBase = evaluateAsLValue(idxExpr->getBase());
@@ -5422,11 +7498,86 @@ private:
               mapBase, voidPtrTy, "map.ptr.cast", expr.getLoc());
 
           visit(idxExpr->getIndex());
-          MIRValue *keyPtr = prepareAnyPtr(lastExprValue, exactKeyTy);
+          MIRValue *rawKey = lastExprValue;
+          MIRValue *keyPtr = prepareAnyPtr(rawKey, exactKeyTy);
 
           visit(expr.getRHS());
           MIRValue *rawRhsVal = lastExprValue;
           MIRValue *valPtr = prepareAnyPtr(rawRhsVal, exactValTy);
+
+          auto retainAnyPayload = [&](MIRValue *anyBox,
+                                      const hir::HIRType *exactTy) {
+            bool typeIsARC = false;
+            const hir::HIRType *checkTy = stripMemoryModifiers(exactTy);
+            while (checkTy) {
+              if (auto *ptrTy =
+                      llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+                if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+                    ptrTy->getOwnership() == hir::Ownership::Owned ||
+                    ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+                  typeIsARC = true;
+                }
+                checkTy = stripMemoryModifiers(ptrTy->getPointee());
+              } else if (auto *refTy =
+                             llvm::dyn_cast_or_null<hir::ReferenceType>(
+                                 checkTy)) {
+                if (refTy->getOwnership() == hir::Ownership::Shared ||
+                    refTy->getOwnership() == hir::Ownership::Owned ||
+                    refTy->getInner()->getKind() == hir::TypeKind::Any) {
+                  typeIsARC = true;
+                }
+                checkTy = stripMemoryModifiers(refTy->getInner());
+              } else if (auto *nullTy =
+                             llvm::dyn_cast_or_null<hir::HIRNullableType>(
+                                 checkTy)) {
+                checkTy = stripMemoryModifiers(nullTy->getInner());
+              } else {
+                break;
+              }
+            }
+            if (checkTy) {
+              auto k = checkTy->getKind();
+              if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+                  k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
+                  k == hir::TypeKind::Closure || k == hir::TypeKind::Function ||
+                  k == hir::TypeKind::Any || k == hir::TypeKind::Promise ||
+                  checkTy->toString().find("Arc<") != std::string::npos ||
+                  checkTy->toString().find("Box<") != std::string::npos ||
+                  checkTy->toString().find("closure") != std::string::npos) {
+                typeIsARC = true;
+              }
+            }
+
+            if (typeIsARC) {
+              auto *i32Ty =
+                  const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
+              auto *anyLayoutTy =
+                  const_cast<hir::HIRModule *>(hirModule)->getStructType(
+                      "__moksha_any_layout", {voidPtrTy, voidPtrTy});
+              auto *anyLayoutPtrTy =
+                  const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                      anyLayoutTy, hir::Ownership::None);
+              MIRValue *layoutCast = builder->createBitCast(
+                  anyBox, anyLayoutPtrTy, "any.layout.cast", expr.getLoc());
+              auto *zero =
+                  mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+              MIRValue *dataGep =
+                  builder->createGEP(layoutCast, {zero, zero}, anyLayoutTy,
+                                     "any.data.gep", expr.getLoc());
+              auto *voidPtrPtrTy =
+                  const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                      voidPtrTy, hir::Ownership::None);
+              MIRValue *dataGepCast = builder->createBitCast(
+                  dataGep, voidPtrPtrTy, "any.data.gep.cast", expr.getLoc());
+              MIRValue *payloadPtr = builder->insert(std::make_unique<LoadInst>(
+                  dataGepCast, "any.data.load", expr.getLoc()));
+              builder->insert(std::make_unique<ARCInst>(
+                  Opcode::Retain, payloadPtr, nullptr, expr.getLoc()));
+            }
+          };
+
+          retainAnyPayload(keyPtr, exactKeyTy);
+          retainAnyPayload(valPtr, exactValTy);
 
           std::string insertName = "moksha_rt_map_insert";
           MIRFunction *insertFunc = mirModule->getFunction(insertName);
@@ -5679,22 +7830,18 @@ private:
         }
 
         if (lhsPtr && lhsPtr->getType()) {
+          const hir::HIRType *expectedPointee = nullptr;
           if (auto *pTy =
                   llvm::dyn_cast_or_null<hir::PointerType>(lhsPtr->getType())) {
-            auto *rawTy =
-                const_cast<hir::HIRModule *>(hirModule)->getPointerType(
-                    pTy->getPointee(), hir::Ownership::None);
-            if (lhsPtr->getType() != rawTy) {
-              lhsPtr = builder->createBitCast(lhsPtr, rawTy, "store.dest.cast",
-                                              expr.getLoc());
-            }
+            expectedPointee = pTy->getPointee();
           } else if (auto *rTy = llvm::dyn_cast_or_null<hir::ReferenceType>(
                          lhsPtr->getType())) {
-            auto *rawTy =
-                const_cast<hir::HIRModule *>(hirModule)->getPointerType(
-                    rTy->getInner(), hir::Ownership::None);
-            lhsPtr = builder->createBitCast(lhsPtr, rawTy, "store.dest.cast",
-                                            expr.getLoc());
+            expectedPointee = rTy->getInner();
+          }
+
+          if (expectedPointee && rhs->getType() != expectedPointee) {
+            rhs = builder->createBitCast(rhs, expectedPointee, "store.val.cast",
+                                         expr.getLoc());
           }
         }
 
@@ -5702,49 +7849,295 @@ private:
           builder->createStoreWeak(rhs, lhsPtr, expr.getLoc());
         } else {
           bool isARC = false;
-          const hir::HIRType *checkTy = expectedTy;
+          const hir::HIRType *checkTy = stripMemoryModifiers(expectedTy);
 
-          if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
-            checkTy = ptrTy->getPointee();
-            if (ptrTy->getOwnership() == hir::Ownership::Shared ||
-                ptrTy->getOwnership() == hir::Ownership::Owned) {
-              isARC = true;
+          while (checkTy) {
+            if (auto *ptrTy =
+                    llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+              if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+                  ptrTy->getOwnership() == hir::Ownership::Owned ||
+                  ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+                isARC = true;
+              }
+              checkTy = stripMemoryModifiers(ptrTy->getPointee());
+            } else if (auto *refTy = llvm::dyn_cast_or_null<hir::ReferenceType>(
+                           checkTy)) {
+              if (refTy->getOwnership() == hir::Ownership::Shared ||
+                  refTy->getOwnership() == hir::Ownership::Owned ||
+                  refTy->getInner()->getKind() == hir::TypeKind::Any) {
+                isARC = true;
+              }
+              checkTy = stripMemoryModifiers(refTy->getInner());
+            } else if (auto *nullTy =
+                           llvm::dyn_cast_or_null<hir::HIRNullableType>(
+                               checkTy)) {
+              checkTy = stripMemoryModifiers(nullTy->getInner());
+            } else {
+              break;
             }
-          }
-
-          if (auto *nullTy =
-                  llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
-            checkTy = nullTy->getInner();
           }
 
           if (checkTy) {
             auto k = checkTy->getKind();
             if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
-                k == hir::TypeKind::Map || k == hir::TypeKind::Any ||
-                k == hir::TypeKind::Closure || k == hir::TypeKind::Promise ||
-                k == hir::TypeKind::Struct) {
+                k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
+                k == hir::TypeKind::Closure || k == hir::TypeKind::Any ||
+                k == hir::TypeKind::Promise || k == hir::TypeKind::Struct ||
+                checkTy->toString().find("Arc<") != std::string::npos ||
+                checkTy->toString().find("Box<") != std::string::npos ||
+                checkTy->toString().find("closure") != std::string::npos) {
               isARC = true;
+            }
+            if (checkTy->toString().find("Closure.lambda.") !=
+                std::string::npos) {
+              isARC = false;
+            }
+            if (!isARC) {
+              std::string cName = checkTy->toString();
+              while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
+                                        cName[0] == ' ' || cName[0] == '?'))
+                cName = cName.substr(1);
+              if (cName.find("struct.") == 0)
+                cName = cName.substr(7);
+              if (cName.find("class.") == 0)
+                cName = cName.substr(6);
+              for (const auto *cls : hirModule->getClasses()) {
+                if (cls->getName() == cName ||
+                    cName.find(cls->getName() + "<") == 0) {
+                  bool isRef = false;
+                  const hir::HIRType *clsTy = cls->getType();
+                  if (auto *pTy =
+                          llvm::dyn_cast_or_null<hir::PointerType>(clsTy)) {
+                    isRef = true;
+                    clsTy = pTy->getPointee();
+                  } else if (auto *rTy =
+                                 llvm::dyn_cast_or_null<hir::ReferenceType>(
+                                     clsTy)) {
+                    isRef = true;
+                    clsTy = rTy->getInner();
+                  }
+                  if (auto *st =
+                          llvm::dyn_cast_or_null<hir::StructType>(clsTy)) {
+                    if (st->isRefClass())
+                      isRef = true;
+                  }
+                  if (isRef || cls->hasVTable())
+                    isARC = true;
+                  break;
+                }
+              }
             }
           }
 
-          if (isARC && rhs->getType()->getKind() != hir::TypeKind::Null) {
+          if (isARC) {
             MIRValue *rawRhs = rhs;
             if (rhs->getType()->getKind() != hir::TypeKind::Closure) {
               while (auto *c = llvm::dyn_cast_or_null<CastInst>(rawRhs)) {
                 rawRhs = c->getValue();
               }
             }
-            bool isNewAlloc = false;
-            if (auto *call = llvm::dyn_cast_or_null<CallInst>(rawRhs)) {
-              if (call->getCallee() &&
-                  call->getCallee()->getName() == "__moksha_alloc") {
-                isNewAlloc = true;
+
+            bool isTemporary = false;
+            bool isFreshAlloc = false;
+            MIRValue *traceRhs = rhs;
+            while (traceRhs) {
+              if (auto *c = llvm::dyn_cast_or_null<CastInst>(traceRhs)) {
+                traceRhs = c->getValue();
+              } else if (auto *loadInst =
+                             llvm::dyn_cast_or_null<LoadInst>(traceRhs)) {
+                if (loadInst->getPointer() &&
+                    loadInst->getPointer()->getName().find("new.") == 0)
+                  isFreshAlloc = true;
+                traceRhs = loadInst->getPointer();
+              } else if (auto *allocaInst =
+                             llvm::dyn_cast_or_null<AllocaInst>(traceRhs)) {
+                std::string name = allocaInst->getName();
+                if (name.find("temp.arc.alloca") != std::string::npos ||
+                    name.find("box.temp.alloca") != std::string::npos ||
+                    name.find("str.temp.tracked") != std::string::npos ||
+                    name.find("any.box.stack") != std::string::npos ||
+                    name.find("rt.out.spill") != std::string::npos) {
+                  for (int i = scopeStack.size() - 1; i >= 0; --i) {
+                    auto &shared = scopeStack[i].refCountedVars;
+                    auto it =
+                        std::find(shared.begin(), shared.end(), allocaInst);
+                    if (it != shared.end()) {
+                      shared.erase(it);
+                      isTemporary = true;
+                      break;
+                    }
+                  }
+                } else if (name.find("array.raw.stack") != std::string::npos ||
+                           name.find("new.obj.stack") != std::string::npos) {
+                  for (int j = scopeStack.size() - 1; j >= 0; --j) {
+                    auto &owned = scopeStack[j].ownedVars;
+                    auto it = std::find(owned.begin(), owned.end(), allocaInst);
+                    if (it != owned.end()) {
+                      owned.erase(it);
+                      isTemporary = true;
+                      break;
+                    }
+                  }
+                  isFreshAlloc = true;
+                }
+                break;
+              } else if (auto *call =
+                             llvm::dyn_cast_or_null<CallInst>(traceRhs)) {
+                if (call->returnsOwned()) {
+                  isFreshAlloc = true;
+                } else if (call->getCallee()) {
+                  std::string cName = call->getCallee()->getName();
+                  if (cName.find("alloc") != std::string::npos ||
+                      cName.find("string") != std::string::npos ||
+                      cName.find("map_new") != std::string::npos) {
+                    isFreshAlloc = true;
+                  }
+                }
+                break;
+              } else if (auto *inv =
+                             llvm::dyn_cast_or_null<InvokeInst>(traceRhs)) {
+                if (inv->returnsOwned()) {
+                  isFreshAlloc = true;
+                } else if (inv->getCallee()) {
+                  std::string cName = inv->getCallee()->getName();
+                  if (cName.find("alloc") != std::string::npos ||
+                      cName.find("string") != std::string::npos ||
+                      cName.find("map_new") != std::string::npos) {
+                    isFreshAlloc = true;
+                  }
+                }
+                break;
+              } else if (llvm::isa<MakeClosureInst>(traceRhs)) {
+                isFreshAlloc = true;
+                break;
+              } else if (llvm::isa<LoadWeakInst>(traceRhs)) {
+                isFreshAlloc = true;
+                break;
+              } else {
+                break;
               }
             }
 
-            if (!isNewAlloc) {
+            std::string overwrittenDropName = "";
+            const hir::HIRType *dtorCheckTy = checkTy;
+            if (auto *nullTy =
+                    llvm::dyn_cast_or_null<hir::HIRNullableType>(dtorCheckTy)) {
+              dtorCheckTy = stripMemoryModifiers(nullTy->getInner());
+            }
+
+            if (dtorCheckTy->getKind() == hir::TypeKind::Struct) {
+              std::string fName = dtorCheckTy->toString();
+
+              auto removePrefix = [&](const std::string &prefix) {
+                if (fName.find(prefix) == 0)
+                  fName = fName.substr(prefix.length());
+              };
+
+              while (!fName.empty() && (fName[0] == '&' || fName[0] == '*' ||
+                                        fName[0] == ' ' || fName[0] == '?')) {
+                fName = fName.substr(1);
+              }
+
+              removePrefix("shared ");
+              removePrefix("owned ");
+              removePrefix("weak ");
+              removePrefix("mut ");
+              removePrefix("view ");
+              removePrefix("lock ");
+              removePrefix("struct ");
+              removePrefix("class ");
+
+              size_t arcPos = fName.find("Arc<");
+              size_t boxPos = fName.find("Box<");
+              size_t startPos =
+                  (arcPos != std::string::npos)
+                      ? arcPos
+                      : ((boxPos != std::string::npos) ? boxPos
+                                                       : std::string::npos);
+              if (startPos != std::string::npos) {
+                fName = fName.substr(startPos + 4);
+                size_t endPos = fName.rfind(">");
+                if (endPos != std::string::npos)
+                  fName = fName.substr(0, endPos);
+              }
+
+              if (!fName.empty() && fName.back() == '?')
+                fName.pop_back();
+
+              overwrittenDropName = fName + ".destructor_ret_void";
+            } else if (dtorCheckTy &&
+                       dtorCheckTy->getKind() == hir::TypeKind::Map) {
+              overwrittenDropName = "";
+            } else if (dtorCheckTy &&
+                       (dtorCheckTy->getKind() == hir::TypeKind::Slice ||
+                        dtorCheckTy->getKind() == hir::TypeKind::Array)) {
+              overwrittenDropName =
+                  getOrCreateArrayDestructor(dtorCheckTy)->getName();
+            }
+
+            MIRFunction *overwrittenDropFunc =
+                overwrittenDropName.empty()
+                    ? nullptr
+                    : mirModule->getFunction(overwrittenDropName);
+
+            if (!isTemporary && !isFreshAlloc &&
+                rhs->getType()->getKind() != hir::TypeKind::Null) {
+              MIRValue *rhsSpill = builder->createAlloca(
+                  rhs->getType(), "rhs.spill", expr.getLoc());
+              builder->insert(
+                  std::make_unique<StoreInst>(rhs, rhsSpill, expr.getLoc()));
+              emitDeepRetain(rhsSpill, expectedTy, false, expr.getLoc());
+            }
+
+            MIRValue *oldVal =
+                builder->createLoad(lhsPtr, "old.arc.val", expr.getLoc());
+
+            bool isClosureType =
+                (expectedTy->getKind() == hir::TypeKind::Closure ||
+                 expectedTy->toString().find("closure") != std::string::npos ||
+                 expectedTy->toString().find("Closure") != std::string::npos);
+
+            if (isClosureType) {
+              auto *voidTy =
+                  const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+              auto *voidPtrTy =
+                  const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                      voidTy, hir::Ownership::None);
+              MIRValue *envPtr =
+                  builder->insert(std::make_unique<ExtractValueInst>(
+                      oldVal, 1, voidPtrTy, "env.ext", expr.getLoc()));
+
+              std::string relName = "moksha_rt_release_closure_env";
+              ensureBuiltinMIR(relName);
+              MIRFunction *relFunc = mirModule->getFunction(relName);
+              if (!relFunc) {
+                auto fn = std::make_unique<MIRFunction>(voidTy, relName,
+                                                        Linkage::External);
+                fn->addArgument(
+                    std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+                relFunc = fn.get();
+                mirModule->addFunction(std::move(fn));
+              }
+              builder->insert(std::make_unique<CallInst>(
+                  relFunc, std::vector<MIRValue *>{envPtr}, voidTy, "", false,
+                  expr.getLoc()));
+            } else if (expectedTy->getKind() == hir::TypeKind::Any ||
+                       expectedTy->getKind() == hir::TypeKind::Array ||
+                       expectedTy->getKind() == hir::TypeKind::Struct) {
+              if (overwrittenDropFunc) {
+                MIRValue *argVal = builder->createBitCast(
+                    lhsPtr,
+                    overwrittenDropFunc->getRawArguments()[0]->getType(),
+                    "drop.cast", expr.getLoc());
+                auto *voidTy =
+                    const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+                builder->insert(std::make_unique<CallInst>(
+                    overwrittenDropFunc, std::vector<MIRValue *>{argVal},
+                    voidTy, "", false, expr.getLoc()));
+              }
+            } else {
               builder->insert(std::make_unique<ARCInst>(
-                  Opcode::Retain, rawRhs, nullptr, expr.getLoc()));
+                  Opcode::Release, oldVal, overwrittenDropFunc, expr.getLoc()));
             }
           }
 
@@ -5756,23 +8149,6 @@ private:
           }
           if (isVolatilePointer(rhs)) {
             volatileVars.insert(lhsPtr);
-          }
-
-          MIRValue *movedAlloca = nullptr;
-          MIRValue *tracedRhs = rhs;
-          while (auto *cast = llvm::dyn_cast_or_null<CastInst>(tracedRhs)) {
-            tracedRhs = cast->getValue();
-          }
-          if (auto *load = llvm::dyn_cast_or_null<LoadInst>(tracedRhs)) {
-            movedAlloca = load->getPointer();
-          }
-
-          if (movedAlloca) {
-            for (auto &scope : scopeStack) {
-              auto &owned = scope.ownedVars;
-              owned.erase(std::remove(owned.begin(), owned.end(), movedAlloca),
-                          owned.end());
-            }
           }
         }
       }
@@ -5935,7 +8311,7 @@ private:
         phi->addIncoming(lhsCast, lhsUnboxEndBlock);
         phi->addIncoming(rhsCast, rhsEndBlock);
 
-        lastExprValue = phi;
+        setTrackedExprValue(phi, expr.getLoc());
 
         MIRBlock *safeContinuation = newBlock("nullcoal.safe.cont");
         builder->createBr(safeContinuation);
@@ -6036,9 +8412,15 @@ private:
         mirModule->addFunction(std::move(fn));
       }
 
-      lastExprValue =
+      MIRValue *concatRes =
           builder->createCall(concatFunc, {strLhs, strRhs}, stringTy, "str.add",
                               false, expr.getLoc());
+
+      if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(concatRes)) {
+        callInst->setReturnsOwned(true);
+      }
+
+      setTrackedExprValue(concatRes, expr.getLoc());
       return;
     }
 
@@ -6144,8 +8526,26 @@ private:
       return val;
     };
 
-    lhs = autoDeref(lhs);
-    rhs = autoDeref(rhs);
+    bool isPtrRelationalOp = expr.getOp() == hir::BinaryOp::Equal ||
+                             expr.getOp() == hir::BinaryOp::NotEqual ||
+                             expr.getOp() == hir::BinaryOp::Less ||
+                             expr.getOp() == hir::BinaryOp::LessEqual ||
+                             expr.getOp() == hir::BinaryOp::Greater ||
+                             expr.getOp() == hir::BinaryOp::GreaterEqual;
+
+    bool isPointerComparison =
+        isPtrRelationalOp &&
+        (lhs->getType()->getKind() == hir::TypeKind::Pointer ||
+         rhs->getType()->getKind() == hir::TypeKind::Pointer ||
+         lhs->getType()->getKind() == hir::TypeKind::Nullable ||
+         rhs->getType()->getKind() == hir::TypeKind::Nullable ||
+         lhs->getType()->getKind() == hir::TypeKind::Null ||
+         rhs->getType()->getKind() == hir::TypeKind::Null);
+
+    if (!isPointerComparison) {
+      lhs = autoDeref(lhs);
+      rhs = autoDeref(rhs);
+    }
 
     // Operator Overloading Interception for Binary Expressions
     if (lhs->getType() && lhs->getType()->getKind() == hir::TypeKind::Struct) {
@@ -6209,7 +8609,7 @@ private:
           if (lhs->getType() &&
               lhs->getType()->getKind() != hir::TypeKind::Pointer) {
             thisArg =
-                builder->createAlloca(lhs->getType(), "op.this", expr.getLoc());
+                createHoistedAlloca(lhs->getType(), "op.this", expr.getLoc());
             builder->createStore(lhs, thisArg, expr.getLoc());
           }
 
@@ -6466,7 +8866,7 @@ private:
         phi->addIncoming(nullRes, checkBlock);
         phi->addIncoming(primCmp, unboxEnd);
 
-        lastExprValue = phi;
+        setTrackedExprValue(phi, expr.getLoc());
         return;
       }
     }
@@ -7020,7 +9420,7 @@ private:
           if (val->getType() &&
               val->getType()->getKind() != hir::TypeKind::Pointer) {
             thisArg =
-                builder->createAlloca(val->getType(), "op.this", expr.getLoc());
+                createHoistedAlloca(val->getType(), "op.this", expr.getLoc());
             builder->createStore(val, thisArg, expr.getLoc());
           }
 
@@ -7293,7 +9693,7 @@ private:
     } else if (base->getType() &&
                base->getType()->getKind() == hir::TypeKind::Struct) {
       auto *tempAlloca =
-          builder->createAlloca(base->getType(), "struct.spill", expr.getLoc());
+          createHoistedAlloca(base->getType(), "struct.spill", expr.getLoc());
       builder->insert(
           std::make_unique<StoreInst>(base, tempAlloca, expr.getLoc()));
       base = tempAlloca;
@@ -7650,8 +10050,31 @@ private:
       return;
     }
 
-    MIRValue *lvalueBase = evaluateAsLValue(expr.getBase());
-    MIRValue *base = lvalueBase;
+    bool savedLValueContext = isLValueContext;
+    isLValueContext = false;
+    const hir::HIRType *baseAstTy =
+        stripMemoryModifiers(expr.getBase()->getType());
+    bool forceLValue = false;
+    if (baseAstTy) {
+      if (baseAstTy->getKind() == hir::TypeKind::Array) {
+        forceLValue = true;
+      } else if (auto *pTy =
+                     llvm::dyn_cast_or_null<hir::PointerType>(baseAstTy)) {
+        if (pTy->getPointee()->getKind() == hir::TypeKind::Array) {
+          forceLValue = true;
+        }
+      }
+    }
+
+    MIRValue *base = nullptr;
+    if (forceLValue) {
+      isLValueContext = true;
+      base = evaluateAsLValue(expr.getBase());
+    } else {
+      visit(expr.getBase());
+      base = lastExprValue;
+    }
+    isLValueContext = savedLValueContext;
 
     // Optional Chaining Short-Circuit
     MIRBlock *checkBlock = nullptr;
@@ -7682,9 +10105,13 @@ private:
           static_cast<const hir::PointerType *>(base->getType())->getPointee();
       if (pointeeTy && pointeeTy->getKind() == hir::TypeKind::Array) {
       } else {
-        auto *baseLoad = builder->createLoad(base, "base.load", expr.getLoc());
-        baseLoad->setBorrowKind(mir::BorrowKind::View);
-        base = baseLoad;
+        if (llvm::isa<AllocaInst>(base) || llvm::isa<GetElementPtrInst>(base) ||
+            llvm::isa<MIRGlobal>(base) || llvm::isa<CastInst>(base)) {
+          auto *baseLoad =
+              builder->createLoad(base, "base.load", expr.getLoc());
+          baseLoad->setBorrowKind(mir::BorrowKind::View);
+          base = baseLoad;
+        }
       }
     }
 
@@ -7699,7 +10126,6 @@ private:
       }
     }
 
-    bool savedLValueContext = isLValueContext;
     isLValueContext = false;
     visit(expr.getIndex());
     isLValueContext = savedLValueContext;
@@ -7754,7 +10180,7 @@ private:
       if (isAnyLookup) {
         if (castBase->getType()->getKind() == hir::TypeKind::Any) {
           auto *spill =
-              builder->createAlloca(anyTy, "any.base.spill", expr.getLoc());
+              createHoistedAlloca(anyTy, "any.base.spill", expr.getLoc());
           builder->insert(
               std::make_unique<StoreInst>(castBase, spill, expr.getLoc()));
           castBase = spill;
@@ -7789,12 +10215,14 @@ private:
       }
 
       if (castIdx->getType()->getKind() != hir::TypeKind::Any) {
-        castIdx = boxValue(castIdx, castIdx->getType(), anyTy, expr.getLoc());
+        castIdx = emitExplicitAnyBox(
+            castIdx, exactKeyTy ? exactKeyTy : castIdx->getType(),
+            expr.getLoc());
       }
 
-      if (castIdx->getType()->getKind() != hir::TypeKind::Pointer) {
-        auto *spill = builder->createAlloca(castIdx->getType(), "map.key.spill",
-                                            expr.getLoc());
+      if (castIdx->getType() == anyTy) {
+        auto *spill =
+            createHoistedAlloca(anyTy, "map.key.spill", expr.getLoc());
         builder->insert(
             std::make_unique<StoreInst>(castIdx, spill, expr.getLoc()));
         castIdx = spill;
@@ -7850,11 +10278,9 @@ private:
         bool isPtrType = innerTy->getKind() == hir::TypeKind::Pointer ||
                          innerTy->getKind() == hir::TypeKind::Reference ||
                          innerTy->getKind() == hir::TypeKind::String ||
+                         innerTy->getKind() == hir::TypeKind::Slice ||
                          innerTy->getKind() == hir::TypeKind::Map ||
-                         innerTy->getKind() == hir::TypeKind::Closure ||
-                         innerTy->getKind() == hir::TypeKind::Promise ||
-                         innerTy->getKind() == hir::TypeKind::Array ||
-                         innerTy->getKind() == hir::TypeKind::Slice;
+                         innerTy->getKind() == hir::TypeKind::Promise;
 
         if (isPtrType) {
           finalValidVal = builder->createBitCast(
@@ -8068,6 +10494,7 @@ private:
         if (isVolatilePointer(gep)) {
           loadInst->setVolatile(true);
         }
+        loadInst->setBorrowKind(mir::BorrowKind::View);
         lastExprValue = loadInst;
       }
     }
@@ -8121,6 +10548,7 @@ private:
       phi->addIncoming(nullRes, checkBlock);
       phi->addIncoming(castLoaded, accessEndBlock);
       lastExprValue = phi;
+      lastExprValue->setBorrowKind(mir::BorrowKind::View);
     }
   }
 
@@ -8141,10 +10569,8 @@ private:
     if (trueVal->getType() != expr.getType()) {
       if (expr.getType()->getKind() == hir::TypeKind::Any ||
           trueVal->getType()->getKind() == hir::TypeKind::Any) {
-        ensureStringifierForAny(trueVal->getType());
-        trueVal = builder->insert(
-            std::make_unique<CastInst>(Opcode::AnyCast, trueVal, expr.getType(),
-                                       "ternary.any", expr.getLoc()));
+        trueVal =
+            emitExplicitAnyBox(trueVal, trueVal->getType(), expr.getLoc());
       } else if (auto *ptrTy =
                      llvm::dyn_cast_or_null<hir::PointerType>(expr.getType());
                  ptrTy &&
@@ -8214,16 +10640,40 @@ private:
                        srcAstTy->getKind() == hir::TypeKind::Array ||
                        srcAstTy->getKind() == hir::TypeKind::Struct)) {
 
-        MIRValue *lvalue = evaluateAsLValue(expr.getExpr());
-        if (lvalue) {
-          if (lvalue->getType() != destTy) {
-            lastExprValue = builder->createBitCast(lvalue, destTy, "lval.cast",
-                                                   expr.getLoc());
-          } else {
-            lastExprValue = lvalue;
+        bool isRefClass = false;
+        const hir::HIRType *checkTy = stripMemoryModifiers(srcAstTy);
+        if (auto *p = llvm::dyn_cast_or_null<hir::PointerType>(checkTy))
+          checkTy = stripMemoryModifiers(p->getPointee());
+        if (checkTy) {
+          std::string cName = checkTy->toString();
+          while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
+                                    cName[0] == ' ' || cName[0] == '?'))
+            cName = cName.substr(1);
+          if (cName.find("struct.") == 0)
+            cName = cName.substr(7);
+          if (cName.find("class.") == 0)
+            cName = cName.substr(6);
+          for (const auto *cls : hirModule->getClasses()) {
+            if (cls->getName() == cName ||
+                cName.find(cls->getName() + "<") == 0) {
+              isRefClass = true;
+              break;
+            }
           }
-          applyBorrowKind(lastExprValue, destTy);
-          return;
+        }
+
+        if (!isRefClass) {
+          MIRValue *lvalue = evaluateAsLValue(expr.getExpr());
+          if (lvalue) {
+            if (lvalue->getType() != destTy) {
+              lastExprValue = builder->createBitCast(
+                  lvalue, destTy, "lval.cast", expr.getLoc());
+            } else {
+              lastExprValue = lvalue;
+            }
+            applyBorrowKind(lastExprValue, destTy);
+            return;
+          }
         }
       }
     }
@@ -8284,9 +10734,18 @@ private:
       MIRValue *rawProm =
           builder->createCall(makePromFunc, {arg}, voidPtrTy, "resolved.prom",
                               false, expr.getLoc());
+
+      // Mark owned
+      if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(rawProm)) {
+        callInst->setReturnsOwned(true);
+      }
+
       lastExprValue =
           builder->createBitCast(rawProm, destTy, "prom.cast", expr.getLoc());
       applyBorrowKind(lastExprValue, destTy);
+
+      // Track the temporary promise
+      setTrackedExprValue(lastExprValue, expr.getLoc());
       return;
     }
 
@@ -8347,6 +10806,11 @@ private:
             builder->createCall(viewFunc, {stackPointer, arrayLen}, voidPtrTy,
                                 "slice.view", false, loc);
 
+        // Mark the call as returning an owned ARC object
+        if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(slicePtr)) {
+          callInst->setReturnsOwned(true);
+        }
+
         if (slicePtr->getType() != destTy) {
           lastExprValue =
               builder->createBitCast(slicePtr, destTy, "slice.cast", loc);
@@ -8354,6 +10818,9 @@ private:
           lastExprValue = slicePtr;
         }
         applyBorrowKind(lastExprValue, destTy);
+
+        // Track the temporary to prevent redundant retains and enable cleanup
+        setTrackedExprValue(lastExprValue, expr.getLoc());
         return;
       }
     }
@@ -8396,10 +10863,16 @@ private:
       case hir::CastOp::ZeroExtend:
         mirOp = mir::Opcode::ZExt;
         break;
-      case hir::CastOp::PointerCast:
-      case hir::CastOp::BitCast:
       default:
-        mirOp = mir::Opcode::BitCast;
+        if (val->getType()->getKind() == hir::TypeKind::Int &&
+            destTy->getKind() == hir::TypeKind::Pointer) {
+          mirOp = mir::Opcode::IntToPtr;
+        } else if (val->getType()->getKind() == hir::TypeKind::Pointer &&
+                   destTy->getKind() == hir::TypeKind::Int) {
+          mirOp = mir::Opcode::PtrToInt;
+        } else {
+          mirOp = mir::Opcode::BitCast;
+        }
         break;
       }
 
@@ -8569,6 +11042,9 @@ private:
       }
       objPtr = builder->createAlloca(objTy, "new.obj.stack", expr.getLoc(),
                                      stackAlign);
+      if (!scopeStack.empty()) {
+        scopeStack.back().ownedVars.push_back(objPtr);
+      }
     }
 
     MIRValue *nullStruct =
@@ -8736,9 +11212,6 @@ private:
             }
           }
         }
-        if (!args.empty() && args[0]) {
-          args[0]->setBorrowKind(mir::BorrowKind::View);
-        }
 
         // Exception-Safe Constructor Invocation
         if (currentUnwindDest) {
@@ -8772,6 +11245,7 @@ private:
 
     if (isPtr) {
       lastExprValue = objPtr;
+      setTrackedExprValue(lastExprValue, expr.getLoc());
     } else {
       lastExprValue = builder->insert(
           std::make_unique<LoadInst>(objPtr, "new.val", expr.getLoc()));
@@ -8783,10 +11257,24 @@ private:
     const hir::HIRType *i32Ty =
         const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
 
+    bool isOpaqueClosure = false;
+    const hir::HIRType *closureTy = expr.getType();
+    if (!closureTy && expectedLambdaReturnType) {
+      closureTy = expectedLambdaReturnType;
+    }
+
+    if (closureTy &&
+        (closureTy->getKind() == hir::TypeKind::Closure ||
+         (closureTy->toString().find("closure") != std::string::npos &&
+          closureTy->toString().find("Closure.lambda.") ==
+              std::string::npos))) {
+      isOpaqueClosure = true;
+    }
+
+    bool escapes = inEscapeContext || isOpaqueClosure;
     std::vector<std::pair<std::string, MIRValue *>> captures;
     std::vector<const hir::HIRType *> envMemberTypes;
     std::vector<bool> captureByRef;
-
     auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
     auto *voidPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
         voidTy, hir::Ownership::None);
@@ -8799,7 +11287,6 @@ private:
           captures.push_back({name, symbolMap[name]});
           bool isRef = (cap.kind == hir::CaptureKind::ByReference);
           captureByRef.push_back(isRef);
-
           if (isRef) {
             envMemberTypes.push_back(
                 const_cast<hir::HIRModule *>(hirModule)->getPointerType(
@@ -8823,15 +11310,12 @@ private:
 
         if (name == "this" || isIdentifierUsed(expr.getBody(), name)) {
           captures.push_back({name, val});
-
           bool isRef = (expr.getCaptureMode() == hir::CaptureMode::View ||
                         expr.getCaptureMode() == hir::CaptureMode::Mut);
           const hir::HIRType *valTy = val->getType();
-
           if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(valTy)) {
             valTy = ptrTy->getPointee();
           }
-
           if (valTy && (expr.getCaptureMode() == hir::CaptureMode::Snapshot ||
                         expr.getCaptureMode() == hir::CaptureMode::Move)) {
             auto kind = valTy->getKind();
@@ -8848,7 +11332,6 @@ private:
             llvm::raw_string_ostream ss(buffer);
             expr.getBody()->dump(ss);
             ss.flush();
-
             size_t pos = 0;
             while ((pos = buffer.find("Identifier (" + name + ")", pos)) !=
                    std::string::npos) {
@@ -8858,7 +11341,6 @@ private:
                 size_t start =
                     prevNewline == std::string::npos ? 0 : prevNewline + 1;
                 std::string prevLine = buffer.substr(start, newline - start);
-
                 if (prevLine.find("Op: =") != std::string::npos ||
                     prevLine.find("Op: ++") != std::string::npos ||
                     prevLine.find("Op: --") != std::string::npos ||
@@ -8878,7 +11360,6 @@ private:
           }
 
           captureByRef.push_back(isRef);
-
           if (isRef) {
             envMemberTypes.push_back(
                 const_cast<hir::HIRModule *>(hirModule)->getPointerType(
@@ -8944,13 +11425,40 @@ private:
           std::string dropName = "";
           if (fieldTy->getKind() == hir::TypeKind::Struct) {
             std::string fName = fieldTy->toString();
-            while (!fName.empty() &&
-                   (fName[0] == '&' || fName[0] == '*' || fName[0] == ' '))
+
+            auto removePrefix = [&](const std::string &prefix) {
+              if (fName.find(prefix) == 0)
+                fName = fName.substr(prefix.length());
+            };
+
+            while (!fName.empty() && (fName[0] == '&' || fName[0] == '*' ||
+                                      fName[0] == ' ' || fName[0] == '?')) {
               fName = fName.substr(1);
-            if (fName.find("struct ") == 0)
-              fName = fName.substr(7);
-            if (fName.find("class ") == 0)
-              fName = fName.substr(6);
+            }
+
+            removePrefix("shared ");
+            removePrefix("owned ");
+            removePrefix("weak ");
+            removePrefix("mut ");
+            removePrefix("view ");
+            removePrefix("lock ");
+            removePrefix("struct ");
+            removePrefix("class ");
+
+            size_t arcPos = fName.find("Arc<");
+            size_t boxPos = fName.find("Box<");
+            size_t startPos =
+                (arcPos != std::string::npos)
+                    ? arcPos
+                    : ((boxPos != std::string::npos) ? boxPos
+                                                     : std::string::npos);
+            if (startPos != std::string::npos) {
+              fName = fName.substr(startPos + 4);
+              size_t endPos = fName.rfind(">");
+              if (endPos != std::string::npos)
+                fName = fName.substr(0, endPos);
+            }
+
             dropName = fName + ".destructor_ret_void";
           }
 
@@ -8994,8 +11502,6 @@ private:
     std::vector<MIRValue *> savedCapVals;
 
     if (!captures.empty()) {
-      bool escapes = true;
-
       if (escapes) {
         ensureBuiltinMIR("__moksha_alloc");
         MIRFunction *allocFunc = mirModule->getFunction("__moksha_alloc");
@@ -9022,7 +11528,7 @@ private:
           mirModule->addFunction(std::move(fn));
         }
         MIRValue *typeIdVal =
-            mirModule->getOrInsertConstant<ConstantInt>(19, i32Ty);
+            mirModule->getOrInsertConstant<ConstantInt>(21, i32Ty);
         MIRValue *rawAlloc =
             builder->createCall(allocFunc, {sizeVal, typeIdVal}, voidPtrTy,
                                 "env.alloc.heap", false, expr.getLoc());
@@ -9056,16 +11562,41 @@ private:
           valToStore = builder->insert(std::make_unique<LoadInst>(
               captures[i].second, "cap.load", expr.getLoc()));
 
-          MIRValue *movedAlloca = captures[i].second;
+          if (expr.getCaptureMode() != hir::CaptureMode::Move) {
+            if (auto *loadInst = llvm::dyn_cast_or_null<LoadInst>(valToStore)) {
+              loadInst->setBorrowKind(mir::BorrowKind::View);
+            }
+          }
 
-          for (auto &scope : scopeStack) {
-            auto &owned = scope.ownedVars;
-            owned.erase(std::remove(owned.begin(), owned.end(), movedAlloca),
-                        owned.end());
+          if (expr.getCaptureMode() == hir::CaptureMode::Move) {
+            MIRValue *movedAlloca = captures[i].second;
 
-            auto &shared = scope.refCountedVars;
-            shared.erase(std::remove(shared.begin(), shared.end(), movedAlloca),
-                         shared.end());
+            for (auto &scope : scopeStack) {
+              auto &owned = scope.ownedVars;
+              owned.erase(std::remove(owned.begin(), owned.end(), movedAlloca),
+                          owned.end());
+
+              auto &shared = scope.refCountedVars;
+              shared.erase(
+                  std::remove(shared.begin(), shared.end(), movedAlloca),
+                  shared.end());
+            }
+          } else {
+            const hir::HIRType *fieldTy = envMemberTypes[i + 1];
+            std::string tyStr = fieldTy->toString();
+            bool typeIsARC = fieldTy->getKind() == hir::TypeKind::String ||
+                             fieldTy->getKind() == hir::TypeKind::Slice ||
+                             fieldTy->getKind() == hir::TypeKind::Array ||
+                             fieldTy->getKind() == hir::TypeKind::Map ||
+                             fieldTy->getKind() == hir::TypeKind::Closure ||
+                             fieldTy->getKind() == hir::TypeKind::Any ||
+                             tyStr.find("Arc<") != std::string::npos ||
+                             tyStr.find("Box<") != std::string::npos;
+
+            if (typeIsARC) {
+              builder->insert(std::make_unique<ARCInst>(
+                  Opcode::Retain, valToStore, nullptr, expr.getLoc()));
+            }
           }
         }
 
@@ -9094,7 +11625,6 @@ private:
     }
 
     const hir::HIRType *returnTy = nullptr;
-    const hir::HIRType *closureTy = expr.getType();
     if (!closureTy && expectedLambdaReturnType) {
       closureTy = expectedLambdaReturnType;
     }
@@ -9256,6 +11786,37 @@ private:
           builder->createAlloca(param.type, param.name, expr.getLoc());
       builder->insert(std::make_unique<StoreInst>(arg, alloca, expr.getLoc()));
       symbolMap[param.name] = alloca;
+
+      if (param.type) {
+        auto k = param.type->getKind();
+        if (k == hir::TypeKind::String || k == hir::TypeKind::Map ||
+            k == hir::TypeKind::Slice || k == hir::TypeKind::Closure ||
+            k == hir::TypeKind::Any || k == hir::TypeKind::Promise ||
+            param.type->toString().find("Arc<") != std::string::npos) {
+
+          scopeStack.back().refCountedVars.push_back(alloca);
+
+          bool isClosureType =
+              (k == hir::TypeKind::Closure ||
+               param.type->toString().find("closure") != std::string::npos ||
+               param.type->toString().find("Closure") != std::string::npos);
+
+          if (isClosureType) {
+            auto *voidPtrTy =
+                const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                    const_cast<hir::HIRModule *>(hirModule)->getVoidType(),
+                    hir::Ownership::None);
+            MIRValue *envPtr =
+                builder->insert(std::make_unique<ExtractValueInst>(
+                    arg, 1, voidPtrTy, "env.ext", expr.getLoc()));
+            builder->insert(std::make_unique<ARCInst>(Opcode::Retain, envPtr,
+                                                      nullptr, expr.getLoc()));
+          } else {
+            builder->insert(std::make_unique<ARCInst>(Opcode::Retain, arg,
+                                                      nullptr, expr.getLoc()));
+          }
+        }
+      }
     }
 
     lastExprValue = nullptr;
@@ -9470,21 +12031,67 @@ private:
         } else {
           taggedCap->setBorrowKind(mir::BorrowKind::View);
         }
-        packedEnv.push_back(taggedCap);
-      } else {
-        packedEnv.push_back(savedCapVals[i]);
       }
     }
 
     MIRFunction *func = builder->getInsertBlock()->getParent();
     std::string safeName = func->getUniqueName("closure.val");
-    lastExprValue = builder->createMakeClosure(
+    MIRValue *closureVal = builder->createMakeClosure(
         fnPtr, std::move(packedEnv), fatPtrStructTy, safeName, expr.getLoc());
-    if (isClosureMut) {
-      lastExprValue->setBorrowKind(mir::BorrowKind::Mut);
+    closureVal->setBorrowKind(mir::BorrowKind::None);
+
+    std::string closDtorName = "Closure." + lambdaName + ".destructor_ret_void";
+    auto closDtorF =
+        std::make_unique<MIRFunction>(voidTy, closDtorName, Linkage::Internal);
+    auto *closArg =
+        new MIRArgument(closDtorF.get(),
+                        const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                            fatPtrStructTy, hir::Ownership::None),
+                        0);
+    closArg->setName("this");
+    closDtorF->addArgument(std::unique_ptr<MIRArgument>(closArg));
+
+    MIRBlock *closDtorEntry = new MIRBlock("entry", closDtorF.get());
+    closDtorF->addBlock(std::unique_ptr<MIRBlock>(closDtorEntry));
+
+    MIRBlock *savedBuilderBlock = builder->getInsertBlock();
+    builder->setInsertPoint(closDtorEntry);
+    auto *one = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+
+    // Extract the Env pointer (offset 1 in the fat pointer)
+    MIRValue *envGepDtor = builder->createGEP(
+        closArg, {zero, one}, fatPtrStructTy, "env.gep", expr.getLoc());
+    auto *envPtrPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+        envPtrTy, hir::Ownership::None);
+    MIRValue *castedEnvGep = builder->createBitCast(
+        envGepDtor, envPtrPtrTy, "env.gep.cast", expr.getLoc());
+    MIRValue *envPtrVal =
+        builder->createLoad(castedEnvGep, "env.load", expr.getLoc());
+
+    if (escapes) {
+      // Heap environments are ARC managed
+      builder->insert(std::make_unique<ARCInst>(Opcode::Release, envPtrVal,
+                                                dtorFuncPtr, expr.getLoc()));
     } else {
-      lastExprValue->setBorrowKind(mir::BorrowKind::View);
+      // Stack environments drop directly
+      auto *voidTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+      builder->insert(std::make_unique<CallInst>(
+          dtorFuncPtr, std::vector<MIRValue *>{envPtrVal}, voidTy, "", false,
+          expr.getLoc()));
     }
+
+    builder->insert(std::make_unique<ReturnInst>(nullptr, expr.getLoc()));
+    mirModule->addFunction(std::move(closDtorF));
+
+    builder->setInsertPoint(savedBuilderBlock);
+
+    MIRValue *finalClosureVal = closureVal;
+    if (closureTy && (closureTy->getKind() == hir::TypeKind::Closure ||
+                      closureTy->toString() == "closure")) {
+      finalClosureVal = builder->createBitCast(closureVal, closureTy,
+                                               "closure.cast", expr.getLoc());
+    }
+    setTrackedExprValue(finalClosureVal, expr.getLoc());
   }
 
   void visitThreadExpr(const hir::HIRThreadExpr &expr) override {
@@ -9535,7 +12142,7 @@ private:
     const hir::HIRType *boolTy =
         const_cast<hir::HIRModule *>(hirModule)->getBoolType();
 
-    // 1. Recursive Alignment Resolution Helper
+    // Recursive Alignment Resolution Helper
     auto getMaxAlignment = [&](auto &self, const hir::HIRType *ty) -> uint64_t {
       if (!ty)
         return 0;
@@ -9589,7 +12196,7 @@ private:
       return maxAlign;
     };
 
-    // Helper: Safely calculate Size via dynamic GEP trick
+    // Safely calculate Size via dynamic GEP trick
     auto emitSizeOf = [&](const hir::HIRType *ty) -> MIRValue * {
       auto *one = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
       MIRValue *baseAlloc =
@@ -9605,8 +12212,7 @@ private:
       return builder->createSub(gepInt, baseInt, "sizeof.val", expr.getLoc());
     };
 
-    // Helper: Safely calculate Alignment via dynamic GEP trick or explicit
-    // metadata
+    // Safely calculate Alignment via dynamic GEP trick or explicit metadata
     auto emitAlignOf = [&](const hir::HIRType *ty) -> MIRValue * {
       uint64_t customAlign = getMaxAlignment(getMaxAlignment, ty);
       if (customAlign > 0) {
@@ -9661,7 +12267,7 @@ private:
       return phi;
     };
 
-    // 2. Resolve targetType to Underlying Type
+    // Resolve targetType to Underlying Type
     const hir::HIRType *actualTy = targetTy;
     std::string className = targetTy->toString();
     while (!className.empty() && (className[0] == '*' || className[0] == '&' ||
@@ -9682,7 +12288,7 @@ private:
       }
     }
 
-    // 3. Union Calculation Branch
+    // Union Calculation Branch
     if (auto *ut = llvm::dyn_cast_or_null<hir::UnionType>(actualTy)) {
       MIRValue *maxSize =
           mirModule->getOrInsertConstant<ConstantInt>(0, usizeTy);
@@ -9721,11 +12327,8 @@ private:
       lastExprValue = builder->insert(std::make_unique<BinaryInst>(
           Opcode::And, added, invAlign, "union.padded.size", expr.getLoc()));
     } else {
-      // 4. Standard Primitive/Struct Branch
+      // Standard Primitive/Struct Branch
       MIRValue *rawSize = emitSizeOf(targetTy);
-
-      // Apply explicit alignment padding if the struct has an align(N)
-      // attribute
       uint64_t explicitAlign = getMaxAlignment(getMaxAlignment, targetTy);
 
       if (explicitAlign > 0) {
@@ -9862,21 +12465,16 @@ private:
   visitTemplateStringExpr(const hir::HIRTemplateStringExpr &expr) override {
     auto *stringTy = const_cast<hir::HIRModule *>(hirModule)->getStringType();
     auto *i32Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(32, true);
-
     std::vector<MIRValue *> callArgs;
     size_t numParts = expr.getParts().size();
     callArgs.push_back(
         mirModule->getOrInsertConstant<ConstantInt>(numParts, i32Ty));
-
     for (const auto &part : expr.getParts()) {
       visit(part.get());
       MIRValue *val = lastExprValue;
       MIRValue *strVal = coerceToString(val, expr.getLoc());
-      builder->insert(std::make_unique<ARCInst>(Opcode::Retain, strVal, nullptr,
-                                                expr.getLoc()));
       callArgs.push_back(strVal);
     }
-
     std::string joinName = "__moksha_template_join_strs";
     MIRFunction *joinFunc = mirModule->getFunction(joinName);
     if (!joinFunc) {
@@ -9887,9 +12485,13 @@ private:
       joinFunc = fn.get();
       mirModule->addFunction(std::move(fn));
     }
+    MIRValue *joined = builder->createCall(joinFunc, callArgs, stringTy,
+                                           "interp.str", true, expr.getLoc());
 
-    lastExprValue = builder->createCall(joinFunc, callArgs, stringTy,
-                                        "interp.str", true, expr.getLoc());
+    if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(joined)) {
+      callInst->setReturnsOwned(true);
+    }
+    setTrackedExprValue(joined, expr.getLoc());
   }
 
   void visitInputExpr(const hir::HIRInputExpr &expr) override {
@@ -9927,8 +12529,9 @@ private:
       mirModule->addFunction(std::move(fn));
     }
 
-    lastExprValue = builder->createCall(cstrToStrFunc, {rawInputRes}, strTy,
-                                        "input.res", false, expr.getLoc());
+    MIRValue *inputStr = builder->createCall(
+        cstrToStrFunc, {rawInputRes}, strTy, "input.res", false, expr.getLoc());
+    setTrackedExprValue(inputStr, expr.getLoc());
   }
 
   void visitArrayLiteral(const hir::HIRArrayLiteral &expr) override {
@@ -9999,6 +12602,128 @@ private:
         Opcode::PtrToInt, sizeGep, i32Ty, "sizeof.int", expr.getLoc()));
     sizeofI64 = builder->insert(std::make_unique<CastInst>(
         Opcode::ZExt, sizeofInt, i64Ty, "sizeof.i64", expr.getLoc()));
+
+    auto emitRetainLoop = [&](MIRValue *basePtr, MIRValue *len,
+                              const hir::HIRType *eTy) {
+      bool typeIsARC = false;
+      const hir::HIRType *checkTy = stripMemoryModifiers(eTy);
+      while (checkTy) {
+        if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+          if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+              ptrTy->getOwnership() == hir::Ownership::Owned ||
+              ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+            typeIsARC = true;
+          }
+          checkTy = stripMemoryModifiers(ptrTy->getPointee());
+        } else if (auto *refTy =
+                       llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+          if (refTy->getOwnership() == hir::Ownership::Shared ||
+              refTy->getOwnership() == hir::Ownership::Owned ||
+              refTy->getInner()->getKind() == hir::TypeKind::Any) {
+            typeIsARC = true;
+          }
+          checkTy = stripMemoryModifiers(refTy->getInner());
+        } else if (auto *nullTy =
+                       llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+          checkTy = stripMemoryModifiers(nullTy->getInner());
+        } else {
+          break;
+        }
+      }
+
+      if (checkTy) {
+        auto k = checkTy->getKind();
+        if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+            k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
+            k == hir::TypeKind::Closure || k == hir::TypeKind::Function ||
+            k == hir::TypeKind::Any || k == hir::TypeKind::Promise ||
+            checkTy->toString().find("Arc<") != std::string::npos ||
+            checkTy->toString().find("Box<") != std::string::npos ||
+            checkTy->toString().find("closure") != std::string::npos) {
+          typeIsARC = true;
+        }
+        if (checkTy->toString().find("Closure.lambda.") != std::string::npos) {
+          typeIsARC = false;
+        }
+        if (!typeIsARC) {
+          std::string cName = checkTy->toString();
+          while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
+                                    cName[0] == ' ' || cName[0] == '?'))
+            cName = cName.substr(1);
+          if (cName.find("struct.") == 0)
+            cName = cName.substr(7);
+          if (cName.find("class.") == 0)
+            cName = cName.substr(6);
+          for (const auto *cls : hirModule->getClasses()) {
+            if (cls->getName() == cName ||
+                cName.find(cls->getName() + "<") == 0) {
+              bool isRef = false;
+              const hir::HIRType *clsTy = cls->getType();
+              if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(clsTy)) {
+                isRef = true;
+                clsTy = pTy->getPointee();
+              } else if (auto *rTy = llvm::dyn_cast_or_null<hir::ReferenceType>(
+                             clsTy)) {
+                isRef = true;
+                clsTy = rTy->getInner();
+              }
+              if (auto *st = llvm::dyn_cast_or_null<hir::StructType>(clsTy)) {
+                if (st->isRefClass())
+                  isRef = true;
+              }
+              if (isRef || cls->hasVTable())
+                typeIsARC = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (typeIsARC) {
+        MIRBlock *checkBlock = builder->getInsertBlock();
+        MIRBlock *loopCond = newBlock("spread.retain.cond");
+        MIRBlock *loopBody = newBlock("spread.retain.body");
+        MIRBlock *loopEnd = newBlock("spread.retain.end");
+
+        auto *zero32 = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+        MIRValue *len32 = len;
+        if (len->getType() != i32Ty) {
+          len32 = builder->insert(std::make_unique<CastInst>(
+              Opcode::Trunc, len, i32Ty, "len.trunc", expr.getLoc()));
+        }
+
+        builder->createBr(loopCond);
+        builder->setInsertPoint(loopCond);
+        auto *idxPhi = builder->createPhi(i32Ty, "spread.idx", expr.getLoc());
+        idxPhi->addIncoming(zero32, checkBlock);
+        auto *boolTy = const_cast<hir::HIRModule *>(hirModule)->getBoolType();
+        MIRValue *cmp =
+            builder->createICmp(CompareInst::Predicate::LT, idxPhi, len32,
+                                boolTy, "spread.cmp", expr.getLoc());
+        builder->createCondBr(cmp, loopBody, loopEnd);
+
+        builder->setInsertPoint(loopBody);
+        auto *ePtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+            eTy, hir::Ownership::None);
+        MIRValue *typedBase = basePtr;
+        if (typedBase->getType() != ePtrTy) {
+          typedBase = builder->createBitCast(typedBase, ePtrTy, "base.cast",
+                                             expr.getLoc());
+        }
+        MIRValue *gep = builder->createGEP(typedBase, {idxPhi}, eTy,
+                                           "spread.gep", expr.getLoc());
+
+        emitDeepRetain(gep, eTy, false, expr.getLoc());
+
+        auto *one32 = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+        MIRValue *nextIdx =
+            builder->createAdd(idxPhi, one32, "spread.next", expr.getLoc());
+        idxPhi->addIncoming(nextIdx, builder->getInsertBlock());
+        builder->createBr(loopCond);
+
+        builder->setInsertPoint(loopEnd);
+      }
+    };
 
     struct EvaluatedElement {
       bool isSpread;
@@ -10105,7 +12830,6 @@ private:
 
             builder->createCall(memcpyFunc, {destData, srcVoidPtr, bytesToCopy},
                                 voidTy, "", false, expr.getLoc());
-
             sourceVal = tempSlice;
           }
 
@@ -10172,6 +12896,10 @@ private:
       MIRValue *slicePtr =
           builder->createCall(allocFunc, {sizeofI64, capI64}, voidPtrTy,
                               "slice.alloc", false, expr.getLoc());
+
+      if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(slicePtr)) {
+        callInst->setReturnsOwned(true);
+      }
       ensureBuiltinMIR("moksha_rt_array_push");
       MIRFunction *pushFunc = mirModule->getFunction("moksha_rt_array_push");
       if (!pushFunc) {
@@ -10205,6 +12933,21 @@ private:
                 srcVoidPtr, voidPtrTy, "spread.src.cast", expr.getLoc());
           builder->createCall(extendFunc, {slicePtr, srcVoidPtr, sizeofI64},
                               voidTy, "", false, expr.getLoc());
+          ensureBuiltinMIR("moksha_rt_array_data");
+          MIRFunction *dataFunc =
+              mirModule->getFunction("moksha_rt_array_data");
+          if (!dataFunc) {
+            auto fn = std::make_unique<MIRFunction>(
+                voidPtrTy, "moksha_rt_array_data", Linkage::External);
+            fn->addArgument(
+                std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+            dataFunc = fn.get();
+            mirModule->addFunction(std::move(fn));
+          }
+          MIRValue *rawData =
+              builder->createCall(dataFunc, {srcVoidPtr}, voidPtrTy,
+                                  "spread.src.data", false, expr.getLoc());
+          emitRetainLoop(rawData, evalEl.length, elemTy);
           if (evalEl.type->getKind() == hir::TypeKind::Array) {
             builder->insert(std::make_unique<ARCInst>(
                 Opcode::Release, srcVoidPtr, nullptr, expr.getLoc()));
@@ -10220,6 +12963,14 @@ private:
                                  ->getOwnership() == hir::Ownership::Shared ||
                          static_cast<const hir::PointerType *>(elemTy)
                                  ->getOwnership() == hir::Ownership::Owned))) {
+              if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(
+                      elemVal->getType())) {
+                if (ptrTy->getPointee() == elemTy ||
+                    ptrTy->getPointee()->toString() == elemTy->toString()) {
+                  elemVal = builder->insert(std::make_unique<LoadInst>(
+                      elemVal, "box.load", expr.getLoc()));
+                }
+              }
               elemVal =
                   boxValue(elemVal, elemVal->getType(), elemTy, expr.getLoc());
             } else {
@@ -10229,9 +12980,67 @@ private:
           }
 
           MIRValue *valPtr =
-              builder->createAlloca(elemTy, "push.val.spill", expr.getLoc());
+              createHoistedAlloca(elemTy, "push.val.spill", expr.getLoc());
           builder->insert(
               std::make_unique<StoreInst>(elemVal, valPtr, expr.getLoc()));
+
+          bool isTemporary = false;
+          bool isFreshAlloc = false;
+          MIRValue *traceVal = elemVal;
+          while (traceVal) {
+            if (auto *c = llvm::dyn_cast_or_null<CastInst>(traceVal)) {
+              traceVal = c->getValue();
+            } else if (auto *loadInst =
+                           llvm::dyn_cast_or_null<LoadInst>(traceVal)) {
+              traceVal = loadInst->getPointer();
+            } else if (auto *allocaInst =
+                           llvm::dyn_cast_or_null<AllocaInst>(traceVal)) {
+              if (allocaInst->getName().find("temp.arc.alloca") !=
+                  std::string::npos) {
+                for (int i = scopeStack.size() - 1; i >= 0; --i) {
+                  auto &shared = scopeStack[i].refCountedVars;
+                  auto it = std::find(shared.begin(), shared.end(), allocaInst);
+                  if (it != shared.end()) {
+                    shared.erase(it);
+                    isTemporary = true;
+                    break;
+                  }
+                }
+              } else if (allocaInst->getName().find("array.raw.stack") !=
+                         std::string::npos) {
+                isFreshAlloc = true;
+              }
+              break;
+            } else if (auto *call =
+                           llvm::dyn_cast_or_null<CallInst>(traceVal)) {
+              if (call->getCallee()) {
+                std::string cName = call->getCallee()->getName();
+                if (cName.find("alloc") != std::string::npos ||
+                    cName.find("string") != std::string::npos) {
+                  isFreshAlloc = true;
+                }
+              }
+              break;
+            } else if (auto *inv =
+                           llvm::dyn_cast_or_null<InvokeInst>(traceVal)) {
+              if (inv->returnsOwned()) {
+                isFreshAlloc = true;
+              } else if (inv->getCallee()) {
+                std::string cName = inv->getCallee()->getName();
+                if (cName.find("alloc") != std::string::npos ||
+                    cName.find("string") != std::string::npos) {
+                  isFreshAlloc = true;
+                }
+              }
+              break;
+            } else {
+              break;
+            }
+          }
+
+          emitDeepRetain(valPtr, elemTy, isTemporary || isFreshAlloc,
+                         expr.getLoc());
+
           MIRValue *valVoidPtr = builder->createBitCast(
               valPtr, voidPtrTy, "push.val.void", expr.getLoc());
           builder->createCall(pushFunc, {slicePtr, valVoidPtr, sizeofI64},
@@ -10239,13 +13048,13 @@ private:
         }
       }
 
+      MIRValue *finalSlice = slicePtr;
       if (slicePtr->getType() != rawArrayTy) {
-        lastExprValue = builder->createBitCast(slicePtr, rawArrayTy,
-                                               "slice.cast", expr.getLoc());
-      } else {
-        lastExprValue = slicePtr;
+        finalSlice = builder->createBitCast(slicePtr, rawArrayTy, "slice.cast",
+                                            expr.getLoc());
       }
-      applyBorrowKind(lastExprValue, rawArrayTy);
+      applyBorrowKind(finalSlice, rawArrayTy);
+      setTrackedExprValue(finalSlice, expr.getLoc());
       return;
     }
 
@@ -10264,6 +13073,9 @@ private:
 
     rawAlloc = builder->insert(std::make_unique<AllocaInst>(
         actualArrayPtrTy, actualArrayTy, "array.raw.stack", expr.getLoc(), 0));
+    if (!scopeStack.empty()) {
+      scopeStack.back().ownedVars.push_back(rawAlloc);
+    }
 
     fullArrayPtr = rawAlloc;
     auto *elemPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
@@ -10333,6 +13145,7 @@ private:
 
         builder->createCall(memcpyFunc, {destVoidPtr, srcVoidPtr, bytesToCopy},
                             voidTy, "", false, expr.getLoc());
+        emitRetainLoop(destVoidPtr, evalEl.length, elemTy);
         dynIndex = builder->insert(std::make_unique<BinaryInst>(
             Opcode::Add, dynIndex, evalEl.length, "idx.next", expr.getLoc()));
       } else {
@@ -10346,6 +13159,14 @@ private:
                                ->getOwnership() == hir::Ownership::Shared ||
                        static_cast<const hir::PointerType *>(elemTy)
                                ->getOwnership() == hir::Ownership::Owned))) {
+            if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(
+                    elemVal->getType())) {
+              if (ptrTy->getPointee() == elemTy ||
+                  ptrTy->getPointee()->toString() == elemTy->toString()) {
+                elemVal = builder->insert(std::make_unique<LoadInst>(
+                    elemVal, "box.load", expr.getLoc()));
+              }
+            }
             elemVal =
                 boxValue(elemVal, elemVal->getType(), elemTy, expr.getLoc());
           } else {
@@ -10353,17 +13174,96 @@ private:
                                              expr.getLoc());
           }
         }
-
+        if (auto *ptrTy =
+                llvm::dyn_cast_or_null<hir::PointerType>(elemVal->getType())) {
+          if (ptrTy->getPointee() == elemTy ||
+              ptrTy->getPointee()->toString() == elemTy->toString()) {
+            elemVal = builder->insert(
+                std::make_unique<LoadInst>(elemVal, "box.load", expr.getLoc()));
+          }
+        }
         MIRValue *elemPtr = builder->createGEP(arrayElemPtr, {dynIndex}, elemTy,
                                                "elem.ptr", expr.getLoc());
         builder->insert(
             std::make_unique<StoreInst>(elemVal, elemPtr, expr.getLoc()));
+
+        bool isTemporary = false;
+        bool isFreshAlloc = false;
+        MIRValue *traceVal = elemVal;
+        while (traceVal) {
+          if (auto *c = llvm::dyn_cast_or_null<CastInst>(traceVal)) {
+            traceVal = c->getValue();
+          } else if (auto *loadInst =
+                         llvm::dyn_cast_or_null<LoadInst>(traceVal)) {
+            traceVal = loadInst->getPointer();
+          } else if (auto *allocaInst =
+                         llvm::dyn_cast_or_null<AllocaInst>(traceVal)) {
+            std::string name = allocaInst->getName();
+            if (name.find("temp.arc.alloca") != std::string::npos ||
+                name.find("box.temp.alloca") != std::string::npos ||
+                name.find("str.temp.tracked") != std::string::npos ||
+                name.find("any.box.stack") != std::string::npos ||
+                name.find("rt.out.spill") != std::string::npos) {
+              for (int i = scopeStack.size() - 1; i >= 0; --i) {
+                auto &shared = scopeStack[i].refCountedVars;
+                auto it = std::find(shared.begin(), shared.end(), allocaInst);
+                if (it != shared.end()) {
+                  shared.erase(it); // Steal ownership
+                  isTemporary = true;
+                  break;
+                }
+              }
+            } else if (name.find("array.raw.stack") != std::string::npos ||
+                       name.find("new.obj.stack") != std::string::npos) {
+              for (int j = scopeStack.size() - 1; j >= 0; --j) {
+                auto &owned = scopeStack[j].ownedVars;
+                auto it = std::find(owned.begin(), owned.end(), allocaInst);
+                if (it != owned.end()) {
+                  owned.erase(it);
+                  isTemporary = true;
+                  break;
+                }
+              }
+              isFreshAlloc = true;
+            }
+            break;
+          } else if (auto *call = llvm::dyn_cast_or_null<CallInst>(traceVal)) {
+            if (call->getCallee()) {
+              std::string cName = call->getCallee()->getName();
+              if (cName.find("alloc") != std::string::npos ||
+                  cName.find("string") != std::string::npos) {
+                isFreshAlloc = true;
+              }
+            }
+            break;
+          } else if (auto *inv = llvm::dyn_cast_or_null<InvokeInst>(traceVal)) {
+            if (inv->returnsOwned()) {
+              isFreshAlloc = true;
+            } else if (inv->getCallee()) {
+              std::string cName = inv->getCallee()->getName();
+              if (cName.find("alloc") != std::string::npos ||
+                  cName.find("string") != std::string::npos ||
+                  cName.find("map_new") != std::string::npos) {
+                isFreshAlloc = true;
+              }
+            }
+            break;
+          } else if (llvm::isa<LoadWeakInst>(traceVal)) {
+            isFreshAlloc = true;
+            break;
+          } else {
+            break;
+          }
+        }
+
+        emitDeepRetain(elemPtr, elemTy, isTemporary || isFreshAlloc,
+                       expr.getLoc());
         dynIndex = builder->insert(std::make_unique<BinaryInst>(
             Opcode::Add, dynIndex, one, "idx.next", expr.getLoc()));
       }
     }
 
-    lastExprValue = fullArrayPtr;
+    setTrackedExprValue(fullArrayPtr, expr.getLoc());
   }
 
   void visitMapLiteral(const hir::HIRMapLiteral &expr) override {
@@ -10383,6 +13283,10 @@ private:
     MIRValue *mapVal = builder->createCall(mapNew, {}, voidPtrTy, "map.new",
                                            false, expr.getLoc());
 
+    if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(mapVal)) {
+      callInst->setReturnsOwned(true);
+    }
+
     const hir::HIRType *abiAnyTy = getABICoercedType(anyTy, true);
     std::string insertName = "__moksha_map_insert";
     ensureBuiltinMIR(insertName);
@@ -10400,12 +13304,18 @@ private:
 
     for (auto &pair : expr.getEntries()) {
       visit(pair.first.get());
-      MIRValue *k = lastExprValue;
+      MIRValue *rawK = lastExprValue;
+
+      MIRValue *k = rawK;
       if (k->getType() != anyTy && k->getType() != abiAnyTy) {
         k = boxValue(k, k->getType(), anyTy, expr.getLoc());
       }
+
+      builder->insert(
+          std::make_unique<ARCInst>(Opcode::Retain, k, nullptr, expr.getLoc()));
+
       if (k->getType() == anyTy && abiAnyTy != anyTy) {
-        auto *spill = builder->createAlloca(anyTy, "k.spill", expr.getLoc());
+        auto *spill = createHoistedAlloca(anyTy, "k.spill", expr.getLoc());
         builder->insert(std::make_unique<StoreInst>(k, spill, expr.getLoc()));
         k = spill;
       }
@@ -10417,12 +13327,18 @@ private:
       }
 
       visit(pair.second.get());
-      MIRValue *v = lastExprValue;
+      MIRValue *rawV = lastExprValue;
+
+      MIRValue *v = rawV;
       if (v->getType() != anyTy && v->getType() != abiAnyTy) {
         v = boxValue(v, v->getType(), anyTy, expr.getLoc());
       }
+
+      builder->insert(
+          std::make_unique<ARCInst>(Opcode::Retain, v, nullptr, expr.getLoc()));
+
       if (v->getType() == anyTy && abiAnyTy != anyTy) {
-        auto *spill = builder->createAlloca(anyTy, "v.spill", expr.getLoc());
+        auto *spill = createHoistedAlloca(anyTy, "v.spill", expr.getLoc());
         builder->insert(std::make_unique<StoreInst>(v, spill, expr.getLoc()));
         v = spill;
       }
@@ -10436,8 +13352,10 @@ private:
       builder->createCall(mapInsert, {mapVal, k, v}, voidTy, "", false,
                           expr.getLoc());
     }
-    lastExprValue = builder->createBitCast(mapVal, expr.getType(),
-                                           "map.cast.final", expr.getLoc());
+
+    MIRValue *finalMap = builder->createBitCast(
+        mapVal, expr.getType(), "map.cast.final", expr.getLoc());
+    setTrackedExprValue(finalMap, expr.getLoc());
   }
 
   void visitIntegerLiteral(const hir::HIRIntegerLiteral &expr) override {
@@ -10497,8 +13415,12 @@ private:
       cstrToStrFunc = fn.get();
       mirModule->addFunction(std::move(fn));
     }
-    lastExprValue = builder->createCall(cstrToStrFunc, {rawConst}, ty,
-                                        "str.lit.heap", false, expr.getLoc());
+    MIRValue *strVal = builder->createCall(
+        cstrToStrFunc, {rawConst}, ty, "str.lit.heap", false, expr.getLoc());
+    if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(strVal)) {
+      callInst->setReturnsOwned(true);
+    }
+    setTrackedExprValue(strVal, expr.getLoc());
   }
 
   void visitNullLiteral(const hir::HIRNullLiteral &expr) override {
@@ -11197,7 +14119,8 @@ private:
       // Builtin / Generic Discovery & Type Deduction
       if (!callee && !mirModule->getGlobal(calleeName)) {
         // Intercept Free-Floating Generic Functions
-        const hir::HIRFunction *hirTarget = hirModule->getFunction(calleeName);
+        const hir::HIRFunction *hirTarget =
+            hirModule->getFunction(originalName);
         bool isGenericFunc = false;
 
         if (hirTarget) {
@@ -11431,12 +14354,28 @@ private:
           className = baseTy->toString();
       }
 
-      // Dynamic Generic Sanitizer
-      if (!className.empty() && className[0] == '*')
-        className = className.substr(1);
-      // Strip Nullability from Class Name
-      if (!className.empty() && className.back() == '?')
-        className.pop_back();
+      bool cleaning = true;
+      while (cleaning) {
+        cleaning = false;
+        if (!className.empty() &&
+            (className[0] == '*' || className[0] == '&' ||
+             className[0] == ' ' || className[0] == '?')) {
+          className = className.substr(1);
+          cleaning = true;
+        }
+        if (!className.empty() && className.back() == '?') {
+          className.pop_back();
+          cleaning = true;
+        }
+        for (const char *prefix : {"shared ", "owned ", "weak ", "mut ",
+                                   "view ", "lock ", "struct.", "class."}) {
+          if (className.find(prefix) == 0) {
+            className = className.substr(std::string(prefix).length());
+            cleaning = true;
+          }
+        }
+      }
+
       std::replace(className.begin(), className.end(), '<', '_');
       std::replace(className.begin(), className.end(), '>', '_');
       while (!className.empty() && className.back() == '_')
@@ -11738,7 +14677,10 @@ private:
       lastExprValue = nullptr;
       bool savedLValueContext = isLValueContext;
       isLValueContext = false;
+      const hir::HIRType *oldExpected = expectedLambdaReturnType;
+      expectedLambdaReturnType = nullptr;
       visit(expr.getCallee());
+      expectedLambdaReturnType = oldExpected;
       isLValueContext = savedLValueContext;
       callee = lastExprValue;
       if (callee) {
@@ -11946,6 +14888,12 @@ private:
         lastExprValue = builder->createCall(fn, std::move(callArgs), callRetTy,
                                             "", false, expr.getLoc());
       }
+      if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(lastExprValue)) {
+        callInst->setReturnsOwned(true);
+      } else if (auto *invInst =
+                     llvm::dyn_cast_or_null<InvokeInst>(lastExprValue)) {
+        invInst->setReturnsOwned(true);
+      }
       return;
     }
 
@@ -12128,29 +15076,33 @@ private:
             const_cast<hir::HIRModule *>(hirModule)->getPointerType(
                 anyTy, hir::Ownership::None);
 
-        bool isAlreadyPtrToAny = false;
-        if (argVal->getType()->getKind() == hir::TypeKind::Pointer) {
-          auto *ptrTy =
-              static_cast<const hir::PointerType *>(argVal->getType());
-          if (ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
-            isAlreadyPtrToAny = true;
+        // [FIX]: Prevent double-boxing if the argument is already an 'any'
+        // pointer
+        bool isAlreadyAny = false;
+        if (argVal->getType()->getKind() == hir::TypeKind::Any) {
+          isAlreadyAny = true;
+        } else if (auto *pTy = llvm::dyn_cast_or_null<hir::PointerType>(
+                       argVal->getType())) {
+          if (pTy->getPointee()->getKind() == hir::TypeKind::Any) {
+            isAlreadyAny = true;
           }
         }
 
-        if (!isAlreadyPtrToAny) {
-          if (argVal->getType()->getKind() != hir::TypeKind::Any) {
-            argVal = boxValue(argVal, argVal->getType(), anyTy, expr.getLoc());
-          }
-          auto *spill =
-              builder->createAlloca(anyTy, "any.spill", expr.getLoc());
-          builder->insert(
-              std::make_unique<StoreInst>(argVal, spill, expr.getLoc()));
-          argVal = spill;
+        if (!isAlreadyAny) {
+          argVal = boxValue(argVal, argVal->getType(), anyTy, expr.getLoc());
         }
 
         if (argVal->getType() != anyPtrTy) {
-          argVal = builder->createBitCast(argVal, anyPtrTy,
-                                          "any.cast.safeguard", expr.getLoc());
+          if (argVal->getType()->getKind() == hir::TypeKind::Any) {
+            auto *spill =
+                builder->createAlloca(anyTy, "any.print.spill", expr.getLoc());
+            builder->insert(
+                std::make_unique<StoreInst>(argVal, spill, expr.getLoc()));
+            argVal = spill;
+          } else {
+            argVal = builder->createBitCast(
+                argVal, anyPtrTy, "any.cast.safeguard", expr.getLoc());
+          }
         }
         expectedArgTy = anyPtrTy;
       }
@@ -12169,6 +15121,7 @@ private:
       if (isExternCall) {
         bool needsSpill = false;
         auto argKind = argVal->getType()->getKind();
+
         if (expectedArgTy &&
             expectedArgTy->getKind() == hir::TypeKind::Pointer) {
           auto *ptrTy = static_cast<const hir::PointerType *>(expectedArgTy);
@@ -12189,11 +15142,20 @@ private:
         }
 
         if (needsSpill) {
-          auto *spill = builder->createAlloca(argVal->getType(), "abi.spill",
+          MIRValue *traceVal = argVal;
+          while (auto *cast = llvm::dyn_cast_or_null<CastInst>(traceVal)) {
+            traceVal = cast->getValue();
+          }
+
+          if (auto *loadInst = llvm::dyn_cast_or_null<LoadInst>(traceVal)) {
+            argVal = loadInst->getPointer();
+          } else {
+            auto *spill = createHoistedAlloca(argVal->getType(), "abi.spill",
                                               expr.getLoc());
-          builder->insert(
-              std::make_unique<StoreInst>(argVal, spill, expr.getLoc()));
-          argVal = spill;
+            builder->insert(
+                std::make_unique<StoreInst>(argVal, spill, expr.getLoc()));
+            argVal = spill;
+          }
         }
       }
 
@@ -12222,7 +15184,7 @@ private:
                   boxValue(argVal, argVal->getType(), anyTy, expr.getLoc());
             }
             auto *spill =
-                builder->createAlloca(anyTy, "any.spill", expr.getLoc());
+                createHoistedAlloca(anyTy, "any.spill", expr.getLoc());
             builder->insert(
                 std::make_unique<StoreInst>(argVal, spill, expr.getLoc()));
             argVal = spill;
@@ -12250,11 +15212,6 @@ private:
           argVal = coerceValue(argVal, expectedArgTy, expr.getLoc());
         }
       }
-
-      if (mirF && paramIdx < mirF->getRawArguments().size()) {
-        argVal->setBorrowKind(
-            mirF->getRawArguments()[paramIdx]->getBorrowKind());
-      }
       args.push_back(argVal);
     }
 
@@ -12263,6 +15220,8 @@ private:
         args.size() == hiddenArgOffset) {
       auto *strTy = const_cast<hir::HIRModule *>(hirModule)->getStringType();
       auto *anyTy = const_cast<hir::HIRModule *>(hirModule)->getAnyType();
+      auto *anyPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+          anyTy, hir::Ownership::None);
       auto *i8Ty = const_cast<hir::HIRModule *>(hirModule)->getIntType(8, true);
       auto *i8PtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
           i8Ty, hir::Ownership::None);
@@ -12285,21 +15244,20 @@ private:
           builder->createCall(cstrToStrFunc, {rawConst}, strTy,
                               "empty.str.heap", false, expr.getLoc());
 
-      MIRValue *anyEmpty = builder->insert(std::make_unique<CastInst>(
-          Opcode::AnyCast, emptyStr, anyTy, "empty.any", expr.getLoc()));
-
-      auto *spill = builder->createAlloca(anyTy, "empty.spill", expr.getLoc());
-      builder->insert(
-          std::make_unique<StoreInst>(anyEmpty, spill, expr.getLoc()));
-
-      MIRValue *emptyArg = spill;
-      auto *anyPtrTy = const_cast<hir::HIRModule *>(hirModule)->getPointerType(
-          anyTy, hir::Ownership::None);
-      if (emptyArg->getType() != anyPtrTy) {
-        emptyArg = builder->createBitCast(emptyArg, anyPtrTy, "empty.cast",
-                                          expr.getLoc());
+      MIRValue *anyEmpty = boxValue(emptyStr, strTy, anyTy, expr.getLoc());
+      if (anyEmpty->getType() != anyPtrTy) {
+        if (anyEmpty->getType()->getKind() == hir::TypeKind::Any) {
+          auto *spill =
+              builder->createAlloca(anyTy, "empty.spill", expr.getLoc());
+          builder->insert(
+              std::make_unique<StoreInst>(anyEmpty, spill, expr.getLoc()));
+          anyEmpty = spill;
+        } else {
+          anyEmpty = builder->createBitCast(anyEmpty, anyPtrTy, "empty.cast",
+                                            expr.getLoc());
+        }
       }
-      args.push_back(emptyArg);
+      args.push_back(anyEmpty);
     }
 
     if (calleeName == "print" || calleeName == "println") {
@@ -12568,25 +15526,451 @@ private:
       }
       cArgs.push_back(arrArg);
 
+      if (rtName == "moksha_rt_array_clear") {
+        bool typeIsARC = false;
+        const hir::HIRType *checkTy = stripMemoryModifiers(elemTy);
+
+        if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+          if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+              ptrTy->getOwnership() == hir::Ownership::Owned ||
+              ptrTy->getPointee()->getKind() == hir::TypeKind::Any)
+            typeIsARC = true;
+        } else if (auto *refTy =
+                       llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+          if (refTy->getOwnership() == hir::Ownership::Shared ||
+              refTy->getOwnership() == hir::Ownership::Owned ||
+              refTy->getInner()->getKind() == hir::TypeKind::Any)
+            typeIsARC = true;
+        } else {
+          if (auto *nullTy =
+                  llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+            checkTy = stripMemoryModifiers(nullTy->getInner());
+          }
+          if (checkTy) {
+            auto k = checkTy->getKind();
+            if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+                k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+                k == hir::TypeKind::Function || k == hir::TypeKind::Any ||
+                k == hir::TypeKind::Promise ||
+                checkTy->toString().find("Arc<") != std::string::npos ||
+                checkTy->toString().find("Box<") != std::string::npos) {
+              typeIsARC = true;
+            }
+          }
+        }
+
+        if (typeIsARC) {
+          MIRFunction *lenFunc =
+              mirModule->getFunction("moksha_rt_array_length");
+          if (!lenFunc) {
+            auto fn = std::make_unique<MIRFunction>(
+                i32Ty, "moksha_rt_array_length", Linkage::External);
+            fn->addArgument(
+                std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+            lenFunc = fn.get();
+            mirModule->addFunction(std::move(fn));
+          }
+
+          MIRValue *currLen = builder->createCall(
+              lenFunc, {arrArg}, i32Ty, "curr.len", false, expr.getLoc());
+
+          MIRBlock *clearCheckBlock = builder->getInsertBlock();
+          MIRBlock *loopCond = newBlock("clear.loop.cond");
+          MIRBlock *loopBody = newBlock("clear.loop.body");
+          MIRBlock *loopEnd = newBlock("clear.loop.end");
+
+          auto *zero32 = mirModule->getOrInsertConstant<ConstantInt>(0, i32Ty);
+          MIRValue *isGtZero =
+              builder->createICmp(CompareInst::Predicate::GT, currLen, zero32,
+                                  boolTy, "is.gt.zero", expr.getLoc());
+          builder->createCondBr(isGtZero, loopCond, loopEnd);
+
+          // Loop Condition Block
+          builder->setInsertPoint(loopCond);
+          auto *idxPhi = builder->createPhi(i32Ty, "clear.idx", expr.getLoc());
+          idxPhi->addIncoming(zero32, clearCheckBlock);
+          MIRValue *loopCmp =
+              builder->createICmp(CompareInst::Predicate::LT, idxPhi, currLen,
+                                  boolTy, "clear.cmp", expr.getLoc());
+          builder->createCondBr(loopCmp, loopBody, loopEnd);
+
+          // Loop Body Block
+          builder->setInsertPoint(loopBody);
+          MIRFunction *dataFunc =
+              mirModule->getFunction("moksha_rt_array_data");
+          if (!dataFunc) {
+            auto fn = std::make_unique<MIRFunction>(
+                voidPtrTy, "moksha_rt_array_data", Linkage::External);
+            fn->addArgument(
+                std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+            dataFunc = fn.get();
+            mirModule->addFunction(std::move(fn));
+          }
+
+          MIRValue *rawData = builder->createCall(
+              dataFunc, {arrArg}, voidPtrTy, "arr.data", false, expr.getLoc());
+          auto *elemPtrTy =
+              const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                  elemTy, hir::Ownership::None);
+          MIRValue *dataPtr = builder->createBitCast(rawData, elemPtrTy,
+                                                     "arr.ptr", expr.getLoc());
+          MIRValue *elemGep = builder->createGEP(dataPtr, {idxPhi}, elemTy,
+                                                 "drop.gep", expr.getLoc());
+          MIRValue *elemVal =
+              builder->createLoad(elemGep, "drop.load", expr.getLoc());
+
+          std::string dropName = "";
+          const hir::HIRType *dtorCheckTy = checkTy;
+
+          bool isStructLike = false;
+          const hir::HIRType *actualElemTy = stripMemoryModifiers(elemTy);
+          if (actualElemTy &&
+              actualElemTy->getKind() != hir::TypeKind::Pointer &&
+              actualElemTy->getKind() != hir::TypeKind::Reference &&
+              actualElemTy->getKind() != hir::TypeKind::Nullable) {
+            isStructLike = (actualElemTy->getKind() == hir::TypeKind::Any ||
+                            actualElemTy->getKind() == hir::TypeKind::Array ||
+                            actualElemTy->getKind() == hir::TypeKind::Struct ||
+                            actualElemTy->getKind() == hir::TypeKind::Closure ||
+                            actualElemTy->toString().find("closure") !=
+                                std::string::npos ||
+                            actualElemTy->toString().find("Closure.") !=
+                                std::string::npos);
+          }
+
+          if (dtorCheckTy->getKind() == hir::TypeKind::Slice ||
+              dtorCheckTy->getKind() == hir::TypeKind::Array) {
+            dropName = getOrCreateArrayDestructor(dtorCheckTy)->getName();
+          } else if (dtorCheckTy->getKind() == hir::TypeKind::Map) {
+            dropName = getOrCreateMapDestructor(dtorCheckTy)->getName();
+          } else if (dtorCheckTy->getKind() == hir::TypeKind::Any) {
+            dropName = getOrCreateAnyDestructor()->getName();
+          } else if (dtorCheckTy->getKind() == hir::TypeKind::Struct) {
+            std::string fName = dtorCheckTy->toString();
+            while (!fName.empty() && (fName[0] == '&' || fName[0] == '*' ||
+                                      fName[0] == ' ' || fName[0] == '?'))
+              fName = fName.substr(1);
+            size_t arcPos = fName.find("Arc<");
+            if (arcPos != std::string::npos) {
+              fName = fName.substr(arcPos + 4);
+              size_t endPos = fName.rfind(">");
+              if (endPos != std::string::npos)
+                fName = fName.substr(0, endPos);
+            }
+            dropName = fName + ".destructor_ret_void";
+          }
+
+          MIRFunction *dropFunc =
+              dropName.empty() ? nullptr : mirModule->getFunction(dropName);
+
+          if (isStructLike) {
+            if (dtorCheckTy->getKind() == hir::TypeKind::Closure ||
+                dtorCheckTy->toString().find("closure") != std::string::npos ||
+                dtorCheckTy->toString().find("Closure.") != std::string::npos) {
+              auto *voidPtrTy =
+                  const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                      voidTy, hir::Ownership::None);
+              MIRValue *envPtr =
+                  builder->insert(std::make_unique<ExtractValueInst>(
+                      elemVal, 1, voidPtrTy, "env.ext", expr.getLoc()));
+              std::string relName = "moksha_rt_release_closure_env";
+              ensureBuiltinMIR(relName);
+              MIRFunction *relFunc = mirModule->getFunction(relName);
+              if (!relFunc) {
+                auto fn = std::make_unique<MIRFunction>(voidTy, relName,
+                                                        Linkage::External);
+                fn->addArgument(
+                    std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+                relFunc = fn.get();
+                mirModule->addFunction(std::move(fn));
+              }
+              builder->insert(std::make_unique<CallInst>(
+                  relFunc, std::vector<MIRValue *>{envPtr}, voidTy, "", false,
+                  expr.getLoc()));
+            } else if (dropFunc) {
+              MIRValue *argVal = builder->createBitCast(
+                  elemGep, dropFunc->getRawArguments()[0]->getType(),
+                  "drop.cast", expr.getLoc());
+              builder->insert(std::make_unique<CallInst>(
+                  dropFunc, std::vector<MIRValue *>{argVal}, voidTy, "", false,
+                  expr.getLoc()));
+            }
+          } else if (typeIsARC) {
+            builder->insert(std::make_unique<ARCInst>(Opcode::Release, elemVal,
+                                                      dropFunc, expr.getLoc()));
+          }
+
+          auto *one = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+          MIRValue *nextIdx =
+              builder->createAdd(idxPhi, one, "clear.idx.next", expr.getLoc());
+          idxPhi->addIncoming(nextIdx, builder->getInsertBlock());
+
+          builder->createBr(loopCond);
+
+          // Post-Loop Block
+          builder->setInsertPoint(loopEnd);
+        }
+      }
+
       if (rtName == "moksha_rt_array_push" ||
           rtName == "moksha_rt_array_fill" ||
           rtName == "moksha_rt_array_contains" ||
           rtName == "moksha_rt_array_index") {
         MIRValue *valArg = args[1];
-        auto *spill = builder->createAlloca(valArg->getType(), "val.spill",
-                                            expr.getLoc());
-        builder->insert(
-            std::make_unique<StoreInst>(valArg, spill, expr.getLoc()));
-        MIRValue *valPtr = builder->createBitCast(
-            spill, voidPtrTy, "val.ptr.cast", expr.getLoc());
+        if (rtName == "moksha_rt_array_push" ||
+            rtName == "moksha_rt_array_fill") {
 
-        cArgs.push_back(valPtr);
-        cArgs.push_back(elemSizeVal);
+          auto *spill = builder->createAlloca(valArg->getType(), "val.spill",
+                                              expr.getLoc());
+          builder->insert(
+              std::make_unique<StoreInst>(valArg, spill, expr.getLoc()));
+          emitDeepRetain(spill, valArg->getType(), false, expr.getLoc());
+          MIRValue *valPtr = builder->createBitCast(
+              spill, voidPtrTy, "val.ptr.cast", expr.getLoc());
+
+          cArgs.push_back(valPtr);
+          cArgs.push_back(elemSizeVal);
+        } else if (rtName == "moksha_rt_array_contains" ||
+                   rtName == "moksha_rt_array_index") {
+
+          auto *spill = builder->createAlloca(
+              valArg->getType(), "search.val.spill", expr.getLoc());
+          builder->insert(
+              std::make_unique<StoreInst>(valArg, spill, expr.getLoc()));
+
+          MIRValue *valPtr = builder->createBitCast(
+              spill, voidPtrTy, "search.val.ptr", expr.getLoc());
+
+          cArgs.push_back(valPtr);
+          cArgs.push_back(elemSizeVal);
+        }
       } else if (rtName == "moksha_rt_array_at" ||
                  rtName == "moksha_rt_array_remove" ||
                  rtName == "moksha_rt_array_resize") {
         cArgs.push_back(args[1]);
         cArgs.push_back(elemSizeVal);
+
+        if (rtName == "moksha_rt_array_resize") {
+          bool typeIsARC = false;
+          const hir::HIRType *checkTy = stripMemoryModifiers(elemTy);
+
+          while (checkTy) {
+            if (auto *ptrTy =
+                    llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+              if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+                  ptrTy->getOwnership() == hir::Ownership::Owned ||
+                  ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+                typeIsARC = true;
+              }
+              checkTy = stripMemoryModifiers(ptrTy->getPointee());
+            } else if (auto *refTy = llvm::dyn_cast_or_null<hir::ReferenceType>(
+                           checkTy)) {
+              if (refTy->getOwnership() == hir::Ownership::Shared ||
+                  refTy->getOwnership() == hir::Ownership::Owned ||
+                  refTy->getInner()->getKind() == hir::TypeKind::Any) {
+                typeIsARC = true;
+              }
+              checkTy = stripMemoryModifiers(refTy->getInner());
+            } else if (auto *nullTy =
+                           llvm::dyn_cast_or_null<hir::HIRNullableType>(
+                               checkTy)) {
+              checkTy = stripMemoryModifiers(nullTy->getInner());
+            } else {
+              break;
+            }
+          }
+
+          if (checkTy) {
+            auto k = checkTy->getKind();
+            if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+                k == hir::TypeKind::Map || k == hir::TypeKind::Closure ||
+                k == hir::TypeKind::Function || k == hir::TypeKind::Any ||
+                k == hir::TypeKind::Promise ||
+                checkTy->toString().find("Arc<") != std::string::npos ||
+                checkTy->toString().find("Box<") != std::string::npos ||
+                checkTy->toString().find("closure") != std::string::npos) {
+              typeIsARC = true;
+            }
+            if (checkTy->toString().find("Closure.lambda.") !=
+                std::string::npos) {
+              typeIsARC = false;
+            }
+            if (!typeIsARC) {
+              std::string cName = checkTy->toString();
+              while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
+                                        cName[0] == ' ' || cName[0] == '?'))
+                cName = cName.substr(1);
+              if (cName.find("struct.") == 0)
+                cName = cName.substr(7);
+              if (cName.find("class.") == 0)
+                cName = cName.substr(6);
+              for (const auto *cls : hirModule->getClasses()) {
+                if (cls->getName() == cName ||
+                    cName.find(cls->getName() + "<") == 0) {
+                  bool isRef = false;
+                  const hir::HIRType *clsTy = cls->getType();
+                  if (auto *pTy =
+                          llvm::dyn_cast_or_null<hir::PointerType>(clsTy)) {
+                    isRef = true;
+                    clsTy = pTy->getPointee();
+                  } else if (auto *rTy =
+                                 llvm::dyn_cast_or_null<hir::ReferenceType>(
+                                     clsTy)) {
+                    isRef = true;
+                    clsTy = rTy->getInner();
+                  }
+                  if (auto *st =
+                          llvm::dyn_cast_or_null<hir::StructType>(clsTy)) {
+                    if (st->isRefClass())
+                      isRef = true;
+                  }
+                  if (isRef || cls->hasVTable())
+                    typeIsARC = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (typeIsARC) {
+            MIRValue *newLen = args[1];
+            ensureBuiltinMIR("moksha_rt_array_length");
+            MIRFunction *lenFunc =
+                mirModule->getFunction("moksha_rt_array_length");
+            MIRValue *currLen = builder->createCall(
+                lenFunc, {arrArg}, i32Ty, "curr.len", false, expr.getLoc());
+
+            MIRBlock *shrinkCheckBlock = builder->getInsertBlock();
+            MIRBlock *loopCond = newBlock("resize.shrink.cond");
+            MIRBlock *loopBody = newBlock("resize.shrink.body");
+            MIRBlock *loopEnd = newBlock("resize.shrink.end");
+
+            MIRValue *isShrink =
+                builder->createICmp(CompareInst::Predicate::LT, newLen, currLen,
+                                    boolTy, "is.shrink", expr.getLoc());
+            builder->createCondBr(isShrink, loopCond, loopEnd);
+
+            // Conditional Block
+            builder->setInsertPoint(loopCond);
+            auto *idxPhi =
+                builder->createPhi(i32Ty, "shrink.idx", expr.getLoc());
+            idxPhi->addIncoming(newLen, shrinkCheckBlock);
+            MIRValue *loopCmp =
+                builder->createICmp(CompareInst::Predicate::LT, idxPhi, currLen,
+                                    boolTy, "shrink.cmp", expr.getLoc());
+            builder->createCondBr(loopCmp, loopBody, loopEnd);
+
+            // Body Block
+            builder->setInsertPoint(loopBody);
+            ensureBuiltinMIR("moksha_rt_array_data");
+            MIRFunction *dataFunc =
+                mirModule->getFunction("moksha_rt_array_data");
+            MIRValue *rawData =
+                builder->createCall(dataFunc, {arrArg}, voidPtrTy, "arr.data",
+                                    false, expr.getLoc());
+            auto *elemPtrTy =
+                const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                    elemTy, hir::Ownership::None);
+            MIRValue *dataPtr = builder->createBitCast(
+                rawData, elemPtrTy, "arr.ptr", expr.getLoc());
+            MIRValue *elemGep = builder->createGEP(dataPtr, {idxPhi}, elemTy,
+                                                   "drop.gep", expr.getLoc());
+            MIRValue *elemVal =
+                builder->createLoad(elemGep, "drop.load", expr.getLoc());
+
+            std::string dropName = "";
+            const hir::HIRType *dtorCheckTy = checkTy;
+
+            bool isStructLike = false;
+            const hir::HIRType *actualElemTy = stripMemoryModifiers(elemTy);
+            if (actualElemTy &&
+                actualElemTy->getKind() != hir::TypeKind::Pointer &&
+                actualElemTy->getKind() != hir::TypeKind::Reference &&
+                actualElemTy->getKind() != hir::TypeKind::Nullable) {
+              isStructLike =
+                  (actualElemTy->getKind() == hir::TypeKind::Any ||
+                   actualElemTy->getKind() == hir::TypeKind::Array ||
+                   actualElemTy->getKind() == hir::TypeKind::Struct ||
+                   actualElemTy->getKind() == hir::TypeKind::Closure ||
+                   actualElemTy->toString().find("closure") !=
+                       std::string::npos ||
+                   actualElemTy->toString().find("Closure.") !=
+                       std::string::npos);
+            }
+
+            if (dtorCheckTy->getKind() == hir::TypeKind::Slice ||
+                dtorCheckTy->getKind() == hir::TypeKind::Array) {
+              dropName = getOrCreateArrayDestructor(dtorCheckTy)->getName();
+            } else if (dtorCheckTy->getKind() == hir::TypeKind::Map) {
+              dropName = getOrCreateMapDestructor(dtorCheckTy)->getName();
+            } else if (dtorCheckTy->getKind() == hir::TypeKind::Any) {
+              dropName = getOrCreateAnyDestructor()->getName();
+            } else if (dtorCheckTy->getKind() == hir::TypeKind::Struct) {
+              std::string fName = dtorCheckTy->toString();
+              while (!fName.empty() && (fName[0] == '&' || fName[0] == '*' ||
+                                        fName[0] == ' ' || fName[0] == '?'))
+                fName = fName.substr(1);
+              size_t arcPos = fName.find("Arc<");
+              if (arcPos != std::string::npos) {
+                fName = fName.substr(arcPos + 4);
+                size_t endPos = fName.rfind(">");
+                if (endPos != std::string::npos)
+                  fName = fName.substr(0, endPos);
+              }
+              dropName = fName + ".destructor_ret_void";
+            }
+
+            MIRFunction *dropFunc =
+                dropName.empty() ? nullptr : mirModule->getFunction(dropName);
+
+            if (isStructLike) {
+              if (dtorCheckTy->getKind() == hir::TypeKind::Closure ||
+                  dtorCheckTy->toString().find("closure") !=
+                      std::string::npos ||
+                  dtorCheckTy->toString().find("Closure.") !=
+                      std::string::npos) {
+                auto *voidPtrTy =
+                    const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                        voidTy, hir::Ownership::None);
+                MIRValue *envPtr =
+                    builder->insert(std::make_unique<ExtractValueInst>(
+                        elemVal, 1, voidPtrTy, "env.ext", expr.getLoc()));
+                std::string relName = "moksha_rt_release_closure_env";
+                ensureBuiltinMIR(relName);
+                MIRFunction *relFunc = mirModule->getFunction(relName);
+                if (!relFunc) {
+                  auto fn = std::make_unique<MIRFunction>(voidTy, relName,
+                                                          Linkage::External);
+                  fn->addArgument(
+                      std::make_unique<MIRArgument>(fn.get(), voidPtrTy, 0));
+                  relFunc = fn.get();
+                  mirModule->addFunction(std::move(fn));
+                }
+                builder->insert(std::make_unique<CallInst>(
+                    relFunc, std::vector<MIRValue *>{envPtr}, voidTy, "", false,
+                    expr.getLoc()));
+              } else if (dropFunc) {
+                MIRValue *argVal = builder->createBitCast(
+                    elemGep, dropFunc->getRawArguments()[0]->getType(),
+                    "drop.cast", expr.getLoc());
+                builder->insert(std::make_unique<CallInst>(
+                    dropFunc, std::vector<MIRValue *>{argVal}, voidTy, "",
+                    false, expr.getLoc()));
+              }
+            } else if (typeIsARC) {
+              builder->insert(std::make_unique<ARCInst>(
+                  Opcode::Release, elemVal, dropFunc, expr.getLoc()));
+            }
+
+            auto *one = mirModule->getOrInsertConstant<ConstantInt>(1, i32Ty);
+            MIRValue *nextIdx = builder->createAdd(
+                idxPhi, one, "shrink.idx.next", expr.getLoc());
+            idxPhi->addIncoming(nextIdx, builder->getInsertBlock());
+
+            builder->createBr(loopCond);
+            builder->setInsertPoint(loopEnd);
+          }
+        }
       } else if (rtName == "moksha_rt_array_pop" ||
                  rtName == "moksha_rt_array_reverse" ||
                  rtName == "moksha_rt_array_clone" ||
@@ -12600,6 +15984,9 @@ private:
                                             expr.getLoc());
         builder->insert(
             std::make_unique<StoreInst>(valArg, spill, expr.getLoc()));
+
+        emitDeepRetain(spill, valArg->getType(), false, expr.getLoc());
+
         MIRValue *valPtr = builder->createBitCast(
             spill, voidPtrTy, "val.ptr.cast", expr.getLoc());
 
@@ -12687,41 +16074,43 @@ private:
       }
 
       std::vector<MIRValue *> cArgs;
-      MIRValue *mapArg = args[0];
-      bool isPtrToAny = false;
-      if (auto *pTy =
-              llvm::dyn_cast_or_null<hir::PointerType>(mapArg->getType())) {
-        if (pTy->getPointee()->getKind() == hir::TypeKind::Any) {
-          isPtrToAny = true;
-        }
+
+      const hir::HIRExpr *rawMapExpr = expr.getArgs()[0].get();
+      while (auto *castExpr =
+                 llvm::dyn_cast_or_null<hir::HIRCastExpr>(rawMapExpr)) {
+        rawMapExpr = castExpr->getExpr();
       }
 
-      if (isPtrToAny) {
-        MIRValue *loadedAny =
-            builder->createLoad(mapArg, "map.any.load", expr.getLoc());
-        mapArg = builder->insert(std::make_unique<ExtractValueInst>(
-            loadedAny, 0, voidPtrTy, "map.unboxed.ptr", expr.getLoc()));
-      } else if (mapArg->getType()->getKind() == hir::TypeKind::Any) {
-        mapArg = builder->insert(std::make_unique<ExtractValueInst>(
-            mapArg, 0, voidPtrTy, "map.unboxed.ptr", expr.getLoc()));
-      }
+      bool savedLValContext = isLValueContext;
+      isLValueContext = false;
+      visit(rawMapExpr);
+      isLValueContext = savedLValContext;
+
+      MIRValue *mapArg = lastExprValue;
+      if (!mapArg)
+        mapArg = args[0];
 
       if (mapArg->getType() != voidPtrTy) {
         mapArg = builder->createBitCast(mapArg, voidPtrTy, "rt.map.cast",
                                         expr.getLoc());
       }
-
       cArgs.push_back(mapArg);
+
       if (rtMapName == "moksha_rt_map_has" ||
           rtMapName == "moksha_rt_map_remove") {
-        MIRValue *keyArg = args[1];
+        savedLValContext = isLValueContext;
+        isLValueContext = false;
+        visit(expr.getArgs()[1].get());
+        isLValueContext = savedLValContext;
+        MIRValue *keyArg = lastExprValue;
+
         if (expr.getArgs()[1]->getType()->getKind() != hir::TypeKind::Any) {
           keyArg = boxValue(keyArg, expr.getArgs()[1]->getType(), anyTy,
                             expr.getLoc());
         }
         if (keyArg->getType()->getKind() != hir::TypeKind::Pointer) {
           auto *spill =
-              builder->createAlloca(anyTy, "map.key.spill", expr.getLoc());
+              createHoistedAlloca(anyTy, "map.key.spill", expr.getLoc());
           builder->insert(
               std::make_unique<StoreInst>(keyArg, spill, expr.getLoc()));
           keyArg = spill;
@@ -12732,6 +16121,7 @@ private:
         }
         cArgs.push_back(keyArg);
       }
+
       args = std::move(cArgs);
       callee = rtFunc;
       callRetTy = retTy;
@@ -12970,20 +16360,95 @@ private:
 
     if (!rtFileName.empty()) {
       MIRFunction *rtFunc = mirModule->getFunction(rtFileName);
+      bool needsOutParam =
+          (expr.getType() &&
+           (expr.getType()->getKind() == hir::TypeKind::Any ||
+            expr.getType()->getKind() == hir::TypeKind::Slice));
+
       if (!rtFunc) {
-        const hir::HIRType *retTy = expr.getType();
+        const hir::HIRType *retTy =
+            needsOutParam
+                ? const_cast<hir::HIRModule *>(hirModule)->getVoidType()
+                : expr.getType();
+
         if (!retTy)
           retTy = const_cast<hir::HIRModule *>(hirModule)->getVoidType();
+
         auto fn =
             std::make_unique<MIRFunction>(retTy, rtFileName, Linkage::External);
-        for (size_t k = 0; k < args.size(); k++) {
+        unsigned argIdx = 0;
+        if (needsOutParam) {
+          auto *outPtrTy =
+              const_cast<hir::HIRModule *>(hirModule)->getPointerType(
+                  expr.getType(), hir::Ownership::None);
           fn->addArgument(
-              std::make_unique<MIRArgument>(fn.get(), args[k]->getType(), k));
+              std::make_unique<MIRArgument>(fn.get(), outPtrTy, argIdx++));
+        }
+
+        for (size_t k = 0; k < args.size(); k++) {
+          fn->addArgument(std::make_unique<MIRArgument>(
+              fn.get(), args[k]->getType(), argIdx++));
         }
         rtFunc = fn.get();
         mirModule->addFunction(std::move(fn));
       }
-      callee = rtFunc;
+
+      if (needsOutParam) {
+        MIRValue *outSpill =
+            createHoistedAlloca(expr.getType(), "rt.out.spill", expr.getLoc());
+        args.insert(args.begin(), outSpill);
+        bool requiresCleanup = false;
+        for (const auto &scope : scopeStack) {
+          if (!scope.deferredStmts.empty() || !scope.ownedVars.empty() ||
+              !scope.refCountedVars.empty()) {
+            requiresCleanup = true;
+            break;
+          }
+        }
+
+        if (currentUnwindDest || requiresCleanup) {
+          MIRBlock *normalDest = newBlock("invoke.cont");
+          MIRBlock *cleanupDest = newBlock("invoke.cleanup");
+          builder->createInvoke(
+              rtFunc, std::move(args), normalDest, cleanupDest,
+              const_cast<hir::HIRModule *>(hirModule)->getVoidType(), "",
+              expr.getLoc());
+          builder->setInsertPoint(cleanupDest);
+          MIRBlock *savedUnwind = currentUnwindDest;
+          currentUnwindDest = nullptr;
+          size_t targetDepth =
+              tryScopeDepths.empty() ? 0 : tryScopeDepths.top();
+          for (size_t i = scopeStack.size(); i > targetDepth; --i) {
+            emitScopeCleanup(i - 1, expr.getLoc(), true);
+          }
+          currentUnwindDest = savedUnwind;
+
+          if (currentUnwindDest) {
+            builder->createBr(currentUnwindDest);
+          } else {
+            MIRValue *lpad = builder->createLoad(getExceptionPayloadGlobal(),
+                                                 "ex.cleanup", expr.getLoc());
+            builder->insert(std::make_unique<ResumeInst>(lpad, expr.getLoc()));
+          }
+          builder->setInsertPoint(normalDest);
+        } else {
+          builder->createCall(
+              rtFunc, std::move(args),
+              const_cast<hir::HIRModule *>(hirModule)->getVoidType(), "", false,
+              expr.getLoc());
+        }
+
+        if (!scopeStack.empty()) {
+          scopeStack.back().refCountedVars.push_back(outSpill);
+        }
+
+        lastExprValue = builder->insert(
+            std::make_unique<LoadInst>(outSpill, "rt.out.load", expr.getLoc()));
+        lastExprValue->setBorrowKind(mir::BorrowKind::View);
+        return;
+      } else {
+        callee = rtFunc;
+      }
     }
 
     if (!callee) {
@@ -13025,6 +16490,34 @@ private:
       lastExprValue =
           builder->createInvoke(callee, std::move(args), normalDest,
                                 cleanupDest, callRetTy, "", expr.getLoc());
+
+      if (auto *invInst = llvm::dyn_cast_or_null<InvokeInst>(lastExprValue)) {
+        bool isARCReturn = false;
+        if (callRetTy) {
+          auto k = callRetTy->getKind();
+          if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+              k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
+              k == hir::TypeKind::Closure || k == hir::TypeKind::Any ||
+              k == hir::TypeKind::Promise || k == hir::TypeKind::Struct ||
+              callRetTy->toString().find("Arc<") != std::string::npos ||
+              callRetTy->toString().find("Box<") != std::string::npos ||
+              callRetTy->toString().find("Closure.lambda.") !=
+                  std::string::npos ||
+              callRetTy->toString().find("closure") != std::string::npos) {
+            isARCReturn = true;
+          }
+        }
+        if (isARCReturn || cName.find("__moksha_") == 0 ||
+            cName.find("moksha_rt_array_alloc") == 0 ||
+            cName.find("moksha_rt_array_clone") == 0 ||
+            cName.find("moksha_rt_array_slice") == 0 ||
+            cName.find("moksha_rt_array_remove") == 0 ||
+            cName.find("moksha_rt_array_pop") == 0 ||
+            cName.find("moksha_string_") == 0 ||
+            cName.find("moksha_rt_map_new") == 0) {
+          invInst->setReturnsOwned(true);
+        }
+      }
 
       MIRValue *invokeVal = lastExprValue;
       builder->setInsertPoint(cleanupDest);
@@ -13087,6 +16580,34 @@ private:
       }
       lastExprValue = builder->createCall(callee, std::move(args), callRetTy,
                                           callName, isVarArg, expr.getLoc());
+
+      if (auto *callInst = llvm::dyn_cast_or_null<CallInst>(lastExprValue)) {
+        bool isARCReturn = false;
+        if (callRetTy) {
+          auto k = callRetTy->getKind();
+          if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
+              k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
+              k == hir::TypeKind::Closure || k == hir::TypeKind::Any ||
+              k == hir::TypeKind::Promise || k == hir::TypeKind::Struct ||
+              callRetTy->toString().find("Arc<") != std::string::npos ||
+              callRetTy->toString().find("Box<") != std::string::npos ||
+              callRetTy->toString().find("Closure.lambda.") !=
+                  std::string::npos ||
+              callRetTy->toString().find("closure") != std::string::npos) {
+            isARCReturn = true;
+          }
+        }
+        if (isARCReturn || cName.find("__moksha_") == 0 ||
+            cName.find("moksha_rt_array_alloc") == 0 ||
+            cName.find("moksha_rt_array_clone") == 0 ||
+            cName.find("moksha_rt_array_slice") == 0 ||
+            cName.find("moksha_rt_array_remove") == 0 ||
+            cName.find("moksha_rt_array_pop") == 0 ||
+            cName.find("moksha_string_") == 0 ||
+            cName.find("moksha_rt_map_new") == 0) {
+          callInst->setReturnsOwned(true);
+        }
+      }
     }
 
     applyBorrowKind(lastExprValue, callRetTy);
@@ -13104,7 +16625,16 @@ private:
           isASTRefType = true;
         }
 
-        if (!isASTRefType) {
+        bool isPointerReturnBuiltin =
+            (rtName == "moksha_rt_array_at" ||
+             rtName == "moksha_rt_array_pop" ||
+             rtName == "moksha_rt_array_remove" ||
+             rtMapName == "moksha_rt_map_get_val_at" ||
+             rtMapName == "moksha_rt_map_get_key_at" ||
+             calleeName.find("at_") == 0 || calleeName.find("pop_") == 0 ||
+             calleeName.find("remove_") == 0);
+
+        if (!isASTRefType || isPointerReturnBuiltin) {
           MIRValue *wrapperPtr = lastExprValue;
           auto *targetPtrTy =
               const_cast<hir::HIRModule *>(hirModule)->getPointerType(
@@ -13117,11 +16647,10 @@ private:
               builder->createLoad(wrapperPtr, "abi.ret.load", expr.getLoc());
 
           bool isInteriorPtr = (rtName == "moksha_rt_array_at" ||
-                                rtName == "moksha_rt_array_pop" ||
-                                rtName == "moksha_rt_array_remove" ||
                                 rtMapName == "moksha_rt_map_get_val_at" ||
                                 rtMapName == "moksha_rt_map_get_key_at" ||
                                 calleeName.find("at_") == 0);
+
           if (!isInteriorPtr) {
             std::string freeName = "moksha_mem_free";
             ensureBuiltinMIR(freeName);
@@ -13146,6 +16675,10 @@ private:
             builder->insert(std::make_unique<CallInst>(
                 freeFunc, std::vector<MIRValue *>{castToVoid}, voidTy, "",
                 false, expr.getLoc()));
+            lastExprValue = builder->createBitCast(
+                lastExprValue, expectedAstTy, "ret.owned.cast", expr.getLoc());
+          } else {
+            lastExprValue->setBorrowKind(mir::BorrowKind::View);
           }
         }
       }
@@ -13192,6 +16725,15 @@ private:
             }
           }
 
+          if (actualKind == hir::TypeKind::Pointer &&
+              (expectedKind == hir::TypeKind::Slice ||
+               expectedKind == hir::TypeKind::Map ||
+               expectedKind == hir::TypeKind::String ||
+               expectedKind == hir::TypeKind::Array ||
+               expectedKind == hir::TypeKind::Closure)) {
+            skipCast = false;
+          }
+
           if (!skipCast) {
             lastExprValue = builder->createBitCast(lastExprValue, expectedAstTy,
                                                    "opt.cast", expr.getLoc());
@@ -13199,6 +16741,7 @@ private:
         }
       }
     }
+    setTrackedExprValue(lastExprValue, expr.getLoc());
   }
 
   void visit(const hir::HIRStmt *stmt) {

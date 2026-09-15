@@ -1,0 +1,31 @@
+println("--- [E2E] struct_union_lifetime_edge_cases.mox ---");
+
+struct ResourceHolder {
+    string name;
+    string[] items;
+    table<string, string[]> metadata;
+}
+
+void test_struct_deep_destruction() {
+    ResourceHolder holder;
+    holder.name = "Root";
+    holder.items = ["item1", "item2"];
+    holder.metadata = {"config": ["active", "enabled"]};
+}
+
+void test_container_of_structs() {
+    ResourceHolder h1;
+    h1.name = "H1";
+    h1.items = ["a"];
+
+    ResourceHolder h2;
+    h2.name = "H2";
+    h2.items = ["b"];
+
+    ResourceHolder[] array_of_structs = [h1, h2];
+}
+
+while (true) {
+    test_struct_deep_destruction();
+    test_container_of_structs();
+}

@@ -3,22 +3,30 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* @brief Uncomment the debugger statements when needed */
+
 #if defined(__MOKSHA_BAREMETAL__)
 
 // Minimal stubs for freestanding environments without a filesystem
-MokshaAnyRet moksha_file_open(char *path, int32_t mode) {
+void moksha_file_open(MokshaAny *out_any, char *path, int32_t mode) {
   (void)path;
   (void)mode;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 void moksha_file_close(MokshaAny *file_any) { (void)file_any; }
 void moksha_file_write(MokshaAny *file_any, MokshaAny *data_any) {
   (void)file_any;
   (void)data_any;
 }
-MokshaAnyRet moksha_file_read(MokshaAny *file_any) {
+void moksha_file_read(MokshaAny *out_any, MokshaAny *file_any) {
   (void)file_any;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 int64_t moksha_file_size(MokshaAny *file_any) {
   (void)file_any;
@@ -53,9 +61,12 @@ char *moksha_file_readLine(MokshaAny *file_any) {
   (void)file_any;
   return NULL;
 }
-MokshaAnyRet moksha_file_readLines(MokshaAny *file_any) {
+void moksha_file_readLines(MokshaAny *out_any, MokshaAny *file_any) {
   (void)file_any;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 char *moksha_file_readText(char *path) {
   (void)path;
@@ -77,46 +88,64 @@ void moksha_file_appendBytes(char *path, MokshaAny *data_any) {
   (void)path;
   (void)data_any;
 }
-MokshaAnyRet moksha_file_readBytes(char *path) {
+void moksha_file_readBytes(MokshaAny *out_any, char *path) {
   (void)path;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 void moksha_file_writeJson(char *path, MokshaAny *data_any) {
   (void)path;
   (void)data_any;
 }
-MokshaAnyRet moksha_file_readJson(char *path) {
+void moksha_file_readJson(MokshaAny *out_any, char *path) {
   (void)path;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 void moksha_file_writeYaml(char *path, MokshaAny *data_any) {
   (void)path;
   (void)data_any;
 }
-MokshaAnyRet moksha_file_readYaml(char *path) {
+void moksha_file_readYaml(MokshaAny *out_any, char *path) {
   (void)path;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 void moksha_file_writeCsv(char *path, MokshaAny *data_any) {
   (void)path;
   (void)data_any;
 }
-MokshaAnyRet moksha_file_readCsv(char *path) {
+void moksha_file_readCsv(MokshaAny *out_any, char *path) {
   (void)path;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
-MokshaAnyRet moksha_file_createPdf(char *path) {
+void moksha_file_createPdf(MokshaAny *out_any, char *path) {
   (void)path;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 void moksha_file_writePdfText(MokshaAny *pdf_any, char *text) {
   (void)pdf_any;
   (void)text;
 }
 void moksha_file_savePdf(MokshaAny *pdf_any) { (void)pdf_any; }
-MokshaAnyRet moksha_file_openPdf(char *path) {
+void moksha_file_openPdf(MokshaAny *out_any, char *path) {
   (void)path;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 char *moksha_file_extractText(MokshaAny *pdf_any) {
   (void)pdf_any;
@@ -152,9 +181,12 @@ bool moksha_file_removeDir(char *path) {
   (void)path;
   return false;
 }
-MokshaAnyRet moksha_file_listDir(char *path) {
+void moksha_file_listDir(MokshaAny *out_any, char *path) {
   (void)path;
-  return moksha_pack_any(NULL, NULL);
+  if (out_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+  }
 }
 
 // Keep the dynamic dispatch length utility functional for strings/arrays/maps
@@ -198,6 +230,9 @@ extern const AnyVTable vtable_string;
 extern const AnyVTable vtable_array;
 extern const AnyVTable vtable_map;
 
+extern void *moksha_mem_alloc(size_t size);
+extern void moksha_mem_free(void *ptr);
+
 #ifdef _WIN32
 #include <io.h>
 #define fsync _commit
@@ -207,10 +242,90 @@ extern const AnyVTable vtable_map;
 #define O_BINARY 0
 #endif
 
+#include <stdarg.h>
+#include <stdio.h>
+
+// static volatile long _moksha_open_files_count = 0;
+// static volatile long _moksha_file_ops = 0;
+
+// static inline void trigger_file_debug() {
+//   long ops = __atomic_add_fetch(&_moksha_file_ops, 1, __ATOMIC_RELAXED);
+//   // Print every 10,000 file operations
+//   if (ops % 10000 == 0) {
+//     printf("[FILE DEBUG] Open File Descriptors: %ld\n",
+//            _moksha_open_files_count);
+//   }
+// }
+
+static inline int tracked_open(const char *pathname, int flags, ...) {
+  int fd;
+  if (flags & O_CREAT) {
+    va_list args;
+    va_start(args, flags);
+    int mode = va_arg(args, int);
+    va_end(args);
+    fd = open(pathname, flags, mode);
+  } else {
+    fd = open(pathname, flags);
+  }
+
+  // if (fd >= 0) {
+  //   __atomic_add_fetch(&_moksha_open_files_count, 1, __ATOMIC_RELAXED);
+  //   trigger_file_debug();
+  // }
+  return fd;
+}
+
+static inline int tracked_close(int fd) {
+  int res = close(fd);
+  // if (res == 0) {
+  //   __atomic_sub_fetch(&_moksha_open_files_count, 1, __ATOMIC_RELAXED);
+  //   trigger_file_debug();
+  // }
+  return res;
+}
+
+// Override POSIX calls for the rest of this file
+#define open(path, ...) tracked_open(path, __VA_ARGS__)
+#define close(fd) tracked_close(fd)
+
 // Internal Utilities
 
+static void moksha_array_string_dtor(void *ptr) {
+  MokshaSlice *slice = (MokshaSlice *)ptr;
+  if (!slice || !slice->data)
+    return;
+  char **strings = (char **)slice->data;
+  for (uint64_t i = 0; i < slice->length; i++) {
+    if (strings[i])
+      moksha_rt_release(strings[i]);
+  }
+}
+
+static const AnyVTable vtable_array_string = {18, NULL, moksha_rt_retain,
+                                              moksha_array_string_dtor};
+
+static void moksha_array_any_dtor(void *ptr) {
+  MokshaSlice *slice = (MokshaSlice *)ptr;
+  if (!slice || !slice->data)
+    return;
+  MokshaAny *anys = (MokshaAny *)slice->data;
+  for (uint64_t i = 0; i < slice->length; i++) {
+    if (anys[i].data) {
+      if (anys[i].vtable && anys[i].vtable->drop) {
+        moksha_rt_release_with_dtor(anys[i].data, anys[i].vtable->drop);
+      } else {
+        moksha_rt_release(anys[i].data);
+      }
+    }
+  }
+}
+
+static const AnyVTable vtable_array_any = {18, NULL, moksha_rt_retain,
+                                           moksha_array_any_dtor};
+
 static char *make_mstring(const char *cstr, size_t len) {
-  char *str = (char *)moksha_rt_alloc(len + 1, 1);
+  char *str = (char *)moksha_rt_alloc(len + 1, 16);
   memcpy(str, cstr, len);
   str[len] = '\0';
   return str;
@@ -253,11 +368,15 @@ int32_t moksha_rt_any_len(MokshaAny *any_val) {
 /** @brief Internal Literal Parser for Structured Data */
 static MokshaAny *parse_and_box_literal(const char *val_start, int val_len,
                                         bool is_string) {
+  MokshaAny *box = (MokshaAny *)moksha_rt_alloc(sizeof(MokshaAny), 19);
+
   if (is_string) {
-    char *val_str = moksha_rt_alloc(val_len + 1, MOKSHA_TYPE_STRING);
+    char *val_str = moksha_rt_alloc(val_len + 1, 16); // MOKSHA_TYPE_STRING
     memcpy(val_str, val_start, val_len);
     val_str[val_len] = '\0';
-    return moksha_box_string(val_str);
+    box->data = val_str;
+    box->vtable = &vtable_string;
+    return box;
   }
 
   while (val_len > 0 &&
@@ -270,12 +389,25 @@ static MokshaAny *parse_and_box_literal(const char *val_start, int val_len,
   memcpy(tmp, val_start, copy_len);
   tmp[copy_len] = '\0';
 
-  if (strncmp(tmp, "true", 4) == 0)
-    return moksha_box_bool(true);
-  if (strncmp(tmp, "false", 5) == 0)
-    return moksha_box_bool(false);
-  if (strncmp(tmp, "null", 4) == 0)
-    return moksha_box_string(make_mstring("", 0));
+  if (strncmp(tmp, "true", 4) == 0) {
+    bool *b = moksha_rt_alloc(sizeof(bool), 0);
+    *b = true;
+    box->data = b;
+    box->vtable = NULL;
+    return box;
+  }
+  if (strncmp(tmp, "false", 5) == 0) {
+    bool *b = moksha_rt_alloc(sizeof(bool), 0);
+    *b = false;
+    box->data = b;
+    box->vtable = NULL;
+    return box;
+  }
+  if (strncmp(tmp, "null", 4) == 0) {
+    box->data = NULL;
+    box->vtable = NULL;
+    return box;
+  }
 
   bool is_float = false;
   for (int i = 0; i < copy_len; i++) {
@@ -288,23 +420,39 @@ static MokshaAny *parse_and_box_literal(const char *val_start, int val_len,
   if (is_float) {
     char *endptr;
     double val = strtod(tmp, &endptr);
-    if (endptr != tmp)
-      return moksha_box_f64(val);
+    if (endptr != tmp) {
+      double *d = moksha_rt_alloc(sizeof(double), 14);
+      *d = val;
+      box->data = d;
+      box->vtable = NULL;
+      return box;
+    }
   } else {
     char *endptr;
     long val = strtol(tmp, &endptr, 10);
-    if (endptr != tmp)
-      return moksha_box_i32((int32_t)val);
+    if (endptr != tmp) {
+      int32_t *i = moksha_rt_alloc(sizeof(int32_t), 5);
+      *i = (int32_t)val;
+      box->data = i;
+      box->vtable = NULL;
+      return box;
+    }
   }
 
+  // Fallback to string
   return parse_and_box_literal(val_start, val_len, true);
 }
 
 /** @brief Raw File Descriptor Builtins */
 
-MokshaAnyRet moksha_file_open(char *path, int32_t mode) {
-  if (!path)
-    return moksha_pack_any(NULL, NULL);
+void moksha_file_open(MokshaAny *out_any, char *path, int32_t mode) {
+  if (!out_any)
+    return;
+  if (!path) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   int flags = 0;
   if ((mode & 1) && (mode & 2))
@@ -324,13 +472,17 @@ MokshaAnyRet moksha_file_open(char *path, int32_t mode) {
     flags |= O_TRUNC;
 
   int fd = open(path, flags, 0666);
-  if (fd == -1)
-    return moksha_pack_any(NULL, NULL);
+  if (fd == -1) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   intptr_t *fd_box = (intptr_t *)moksha_rt_alloc(sizeof(intptr_t), 19);
   *fd_box = fd;
 
-  return moksha_pack_any(fd_box, NULL);
+  out_any->data = fd_box;
+  out_any->vtable = NULL;
 }
 
 void moksha_file_close(MokshaAny *file_any) {
@@ -347,17 +499,25 @@ void moksha_file_write(MokshaAny *file_any, MokshaAny *data_any) {
   write(fd, data, strlen(data));
 }
 
-MokshaAnyRet moksha_file_read(MokshaAny *file_any) {
+void moksha_file_read(MokshaAny *out_any, MokshaAny *file_any) {
+  if (!out_any)
+    return;
   int fd = unbox_fd(file_any);
-  if (fd < 0)
-    return moksha_pack_any(NULL, NULL);
+  if (fd < 0) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   struct stat st;
-  if (fstat(fd, &st) < 0)
-    return moksha_pack_any(NULL, NULL);
+  if (fstat(fd, &st) < 0) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   size_t size = st.st_size;
-  char *buf = (char *)moksha_rt_alloc(size + 1, 1);
+  char *buf = (char *)moksha_rt_alloc(size + 1, 16);
 
   ssize_t bytes_read = read(fd, buf, size);
   if (bytes_read < 0)
@@ -365,7 +525,8 @@ MokshaAnyRet moksha_file_read(MokshaAny *file_any) {
   buf[bytes_read] = '\0';
 
   // Attach string vtable so structural equality works
-  return moksha_pack_any(buf, &vtable_string);
+  out_any->data = buf;
+  out_any->vtable = &vtable_string;
 }
 
 int64_t moksha_file_size(MokshaAny *file_any) {
@@ -442,7 +603,7 @@ char *moksha_file_readLine(MokshaAny *file_any) {
 
   size_t cap = 128;
   size_t len = 0;
-  char *buf = (char *)moksha_rt_alloc(cap, 1);
+  char *buf = (char *)moksha_rt_alloc(cap, 16);
   char c;
   bool read_any = false;
 
@@ -455,46 +616,60 @@ char *moksha_file_readLine(MokshaAny *file_any) {
 
     if (len + 1 >= cap) {
       cap *= 2;
-      char *new_buf = (char *)moksha_rt_alloc(cap, 1);
+      char *new_buf = (char *)moksha_rt_alloc(cap, 16);
       memcpy(new_buf, buf, len);
+      moksha_rt_release(buf);
       buf = new_buf;
     }
     buf[len++] = c;
   }
 
-  if (!read_any)
+  if (!read_any) {
+    moksha_rt_release(buf);
     return NULL;
+  }
+
   buf[len] = '\0';
   return buf;
 }
 
-MokshaAnyRet moksha_file_readLines(MokshaAny *file_or_path_any) {
-  if (!file_or_path_any)
-    return moksha_pack_any(NULL, NULL);
+void moksha_file_readLines(MokshaAny *out_any, MokshaAny *file_or_path_any) {
+  if (!out_any)
+    return;
+
+  if (!file_or_path_any) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   int fd = -1;
   bool should_close = false;
+  MokshaAny temp = {NULL, NULL};
 
   if (file_or_path_any->vtable && file_or_path_any->vtable->type_id == 16) {
     char *path = (char *)file_or_path_any->data;
-    MokshaAnyRet open_ret = moksha_file_open(path, 0);
-    MokshaAny temp = {(void *)(uintptr_t)open_ret,
-                      (AnyVTable *)(uintptr_t)(open_ret >> 64)};
+    moksha_file_open(&temp, path, 0);
     fd = unbox_fd(&temp);
     should_close = true;
   } else {
     fd = unbox_fd(file_or_path_any);
   }
 
-  if (fd < 0)
-    return moksha_pack_any(NULL, NULL);
+  if (fd < 0) {
+    if (temp.data)
+      moksha_rt_release(temp.data);
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   intptr_t fd_box = fd;
   MokshaAny temp_any = {&fd_box, NULL};
 
   size_t cap = 16;
   size_t count = 0;
-  char **arr = (char **)moksha_rt_alloc(cap * sizeof(char *), 2);
+  char **arr = (char **)moksha_mem_alloc(cap * sizeof(char *));
 
   while (true) {
     char *line = moksha_file_readLine(&temp_any);
@@ -503,37 +678,45 @@ MokshaAnyRet moksha_file_readLines(MokshaAny *file_or_path_any) {
 
     if (count >= cap) {
       cap *= 2;
-      char **new_arr = (char **)moksha_rt_alloc(cap * sizeof(char *), 2);
+      char **new_arr = (char **)moksha_mem_alloc(cap * sizeof(char *));
       memcpy(new_arr, arr, count * sizeof(char *));
+      // Fix: Free the raw memory, do not ARC release it
+      moksha_mem_free(arr);
       arr = new_arr;
     }
     arr[count++] = line;
   }
 
-  if (should_close)
+  if (should_close) {
     close(fd);
+    // Fix: Clean up the temporary ARC fd_box
+    moksha_rt_release(temp.data);
+  }
 
   MokshaSlice *slice = (MokshaSlice *)moksha_rt_alloc(sizeof(MokshaSlice), 18);
   slice->data = arr;
   slice->length = count;
-  return moksha_pack_any(slice, &vtable_array);
+
+  out_any->data = slice;
+  out_any->vtable = &vtable_array_string;
 }
 
 char *moksha_file_readText(char *path) {
   if (!path)
     return NULL;
 
-  MokshaAnyRet ret = moksha_file_open(path, 0);
-  MokshaAny file_any = {(void *)(uintptr_t)ret,
-                        (const AnyVTable *)(uintptr_t)(ret >> 64)};
+  MokshaAny file_any;
+  moksha_file_open(&file_any, path, 0);
 
   if (unbox_fd(&file_any) < 0)
     return NULL;
 
-  MokshaAnyRet result_ret = moksha_file_read(&file_any);
+  MokshaAny result_any;
+  moksha_file_read(&result_any, &file_any);
   moksha_file_close(&file_any);
 
-  return (char *)(uintptr_t)result_ret;
+  moksha_rt_release(file_any.data);
+  return (char *)result_any.data;
 }
 
 void moksha_file_writeText(char *path, char *text) {
@@ -596,22 +779,32 @@ void moksha_file_appendBytes(char *path, MokshaAny *data_any) {
   }
 }
 
-MokshaAnyRet moksha_file_readBytes(char *path) {
-  if (!path)
-    return moksha_pack_any(NULL, NULL);
+void moksha_file_readBytes(MokshaAny *out_any, char *path) {
+  if (!out_any)
+    return;
+  if (!path) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   int fd = open(path, O_RDONLY | O_BINARY);
-  if (fd < 0)
-    return moksha_pack_any(NULL, NULL);
+  if (fd < 0) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   struct stat st;
   if (fstat(fd, &st) < 0) {
     close(fd);
-    return moksha_pack_any(NULL, NULL);
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
   }
 
   size_t size = st.st_size;
-  char *buf = (char *)moksha_rt_alloc(size, 1);
+  char *buf = (char *)moksha_mem_alloc(size);
 
   ssize_t bytes_read = read(fd, buf, size);
   if (bytes_read < 0)
@@ -621,7 +814,9 @@ MokshaAnyRet moksha_file_readBytes(char *path) {
   MokshaSlice *slice = (MokshaSlice *)moksha_rt_alloc(sizeof(MokshaSlice), 18);
   slice->data = buf;
   slice->length = bytes_read;
-  return moksha_pack_any(slice, &vtable_array);
+
+  out_any->data = slice;
+  out_any->vtable = &vtable_array;
 }
 
 /** @brief Structured Data (JSON / YAML / PDF File Streamers) */
@@ -642,9 +837,10 @@ void moksha_file_writeJson(char *path, MokshaAny *data_any) {
     MokshaAny *k = moksha_rt_map_get_key_at(map_ptr, i);
     MokshaAny *v = moksha_rt_map_get_val_at(map_ptr, i);
 
-    char *k_str = (k && k->data) ? (char *)k->data : (char *)"";
+    const char *k_str = (k && k->data) ? (const char *)k->data : "";
     bool is_str = (v && v->vtable && v->vtable->type_id == 16);
-    char *v_str = is_str ? (char *)v->data : __moksha_any_to_string(v);
+    const char *v_str =
+        is_str ? (const char *)v->data : (v ? __moksha_any_to_string(v) : "");
 
     write(fd, "  \"", 3);
     write(fd, k_str, strlen(k_str));
@@ -656,6 +852,10 @@ void moksha_file_writeJson(char *path, MokshaAny *data_any) {
     if (is_str)
       write(fd, "\"", 1);
 
+    if (!is_str && v) {
+      moksha_rt_release((void *)(uintptr_t)v_str);
+    }
+
     if (i < len - 1)
       write(fd, ",", 1);
     write(fd, "\n", 1);
@@ -664,11 +864,17 @@ void moksha_file_writeJson(char *path, MokshaAny *data_any) {
   close(fd);
 }
 
-MokshaAnyRet moksha_file_readJson(char *path) {
+void moksha_file_readJson(MokshaAny *out_any, char *path) {
+  if (!out_any)
+    return;
+
   char *text = moksha_file_readText(path);
   void *map = moksha_rt_map_new();
-  if (!text)
-    return moksha_pack_any(map, NULL);
+  if (!text) {
+    out_any->data = map;
+    out_any->vtable = &vtable_map;
+    return;
+  }
 
   char *p = text;
   while (*p && *p != '{')
@@ -715,15 +921,23 @@ MokshaAnyRet moksha_file_readJson(char *path) {
     if (is_string && *p == '"')
       p++;
 
-    char *key_str = moksha_rt_alloc(key_len + 1, MOKSHA_TYPE_STRING);
+    char *key_str = moksha_rt_alloc(key_len + 1, 16); // MOKSHA_TYPE_STRING
     memcpy(key_str, key_start, key_len);
     key_str[key_len] = '\0';
-    MokshaAny *kp = moksha_box_string(key_str);
+
+    MokshaAny *kp = (MokshaAny *)moksha_rt_alloc(sizeof(MokshaAny), 19);
+    kp->data = key_str;
+    kp->vtable = &vtable_string;
 
     MokshaAny *vp = parse_and_box_literal(val_start, val_len, is_string);
     moksha_rt_map_insert(map, kp, vp);
+    moksha_rt_release(kp);
+    moksha_rt_release(vp);
   }
-  return moksha_pack_any(map, &vtable_map);
+  if (text)
+    moksha_rt_release(text);
+  out_any->data = map;
+  out_any->vtable = &vtable_map;
 }
 
 void moksha_file_writeYaml(char *path, MokshaAny *data_any) {
@@ -741,23 +955,34 @@ void moksha_file_writeYaml(char *path, MokshaAny *data_any) {
     MokshaAny *k = moksha_rt_map_get_key_at(map_ptr, i);
     MokshaAny *v = moksha_rt_map_get_val_at(map_ptr, i);
 
-    char *k_str = (k && k->data) ? (char *)k->data : (char *)"";
+    const char *k_str = (k && k->data) ? (const char *)k->data : "";
     bool is_str = (v && v->vtable && v->vtable->type_id == 16);
-    char *v_str = is_str ? (char *)v->data : __moksha_any_to_string(v);
+    const char *v_str =
+        is_str ? (const char *)v->data : (v ? __moksha_any_to_string(v) : "");
 
     write(fd, k_str, strlen(k_str));
     write(fd, ": ", 2);
     write(fd, v_str, strlen(v_str));
     write(fd, "\n", 1);
+
+    if (!is_str && v) {
+      moksha_rt_release((void *)(uintptr_t)v_str);
+    }
   }
   close(fd);
 }
 
-MokshaAnyRet moksha_file_readYaml(char *path) {
+void moksha_file_readYaml(MokshaAny *out_any, char *path) {
+  if (!out_any)
+    return;
+
   char *text = moksha_file_readText(path);
   void *map = moksha_rt_map_new();
-  if (!text)
-    return moksha_pack_any(map, NULL);
+  if (!text) {
+    out_any->data = map;
+    out_any->vtable = &vtable_map;
+    return;
+  }
 
   char *p = text;
   while (*p) {
@@ -787,15 +1012,24 @@ MokshaAnyRet moksha_file_readYaml(char *path) {
       val_len -= 2;
     }
 
-    char *key_str = moksha_rt_alloc(key_len + 1, MOKSHA_TYPE_STRING);
+    char *key_str = moksha_rt_alloc(key_len + 1, 16); // MOKSHA_TYPE_STRING
     memcpy(key_str, key_start, key_len);
     key_str[key_len] = '\0';
-    MokshaAny *kp = moksha_box_string(key_str);
+
+    MokshaAny *kp = (MokshaAny *)moksha_rt_alloc(sizeof(MokshaAny), 19);
+    kp->data = key_str;
+    kp->vtable = &vtable_string;
 
     MokshaAny *vp = parse_and_box_literal(val_start, val_len, is_string);
     moksha_rt_map_insert(map, kp, vp);
+    moksha_rt_release(kp);
+    moksha_rt_release(vp);
   }
-  return moksha_pack_any(map, &vtable_map);
+
+  if (text)
+    moksha_rt_release(text);
+  out_any->data = map;
+  out_any->vtable = &vtable_map;
 }
 
 /** @brief CSV File Streamers (Array of Tables) */
@@ -826,9 +1060,9 @@ void moksha_file_writeCsv(char *path, MokshaAny *data_any) {
   // Write Headers
   for (int i = 0; i < cols; i++) {
     MokshaAny *k = moksha_rt_map_get_key_at(map_ptr, i);
-    char *k_str = "";
+    const char *k_str = "";
     if (k && k->vtable && k->vtable->type_id == 16) {
-      k_str = (char *)k->data; // Directly unbox C-string
+      k_str = (const char *)k->data; // Directly unbox C-string
     }
 
     bool needs_quotes = strchr(k_str, ',') != NULL;
@@ -855,8 +1089,8 @@ void moksha_file_writeCsv(char *path, MokshaAny *data_any) {
 
       // Match the JSON/YAML implementation for string extraction
       bool is_str = (v && v->vtable && v->vtable->type_id == 16);
-      char *v_str =
-          is_str ? (char *)v->data : (v ? __moksha_any_to_string(v) : "");
+      const char *v_str =
+          is_str ? (const char *)v->data : (v ? __moksha_any_to_string(v) : "");
 
       bool needs_quotes = strchr(v_str, ',') != NULL;
       if (needs_quotes)
@@ -866,7 +1100,7 @@ void moksha_file_writeCsv(char *path, MokshaAny *data_any) {
         write(fd, "\"", 1);
 
       if (!is_str && v) {
-        moksha_rt_release(v_str);
+        moksha_rt_release((void *)(uintptr_t)v_str);
       }
 
       if (i < cols - 1)
@@ -877,18 +1111,25 @@ void moksha_file_writeCsv(char *path, MokshaAny *data_any) {
   close(fd);
 }
 
-MokshaAnyRet moksha_file_readCsv(char *path) {
+void moksha_file_readCsv(MokshaAny *out_any, char *path) {
+  if (!out_any)
+    return;
+
   MokshaSlice *empty = (MokshaSlice *)moksha_rt_alloc(sizeof(MokshaSlice), 18);
   empty->data = NULL;
   empty->length = 0;
 
   if (!path) {
-    return moksha_pack_any(empty, &vtable_array);
+    out_any->data = empty;
+    out_any->vtable = &vtable_array;
+    return;
   }
 
   int fd = open(path, O_RDONLY | O_BINARY);
   if (fd < 0) {
-    return moksha_pack_any(empty, &vtable_array);
+    out_any->data = empty;
+    out_any->vtable = &vtable_array;
+    return;
   }
 
   off_t size = lseek(fd, 0, SEEK_END);
@@ -900,13 +1141,15 @@ MokshaAnyRet moksha_file_readCsv(char *path) {
 
   if (bytes_read < 0) {
     free(text);
-    return moksha_pack_any(empty, &vtable_array);
+    out_any->data = empty;
+    out_any->vtable = &vtable_array;
+    return;
   }
   text[bytes_read] = '\0';
 
   size_t cap = 16;
   size_t count = 0;
-  MokshaAny *arr = (MokshaAny *)moksha_rt_alloc(cap * sizeof(MokshaAny), 18);
+  MokshaAny *arr = (MokshaAny *)moksha_mem_alloc(cap * sizeof(MokshaAny));
 
   char *p = text;
   char *headers[256];
@@ -964,9 +1207,15 @@ MokshaAnyRet moksha_file_readCsv(char *path) {
           p++;
         int len = p - start;
 
-        MokshaAny *kp = moksha_box_string(headers[i]);
+        moksha_rt_retain(headers[i]);
+        MokshaAny *kp = (MokshaAny *)moksha_rt_alloc(sizeof(MokshaAny), 19);
+        kp->data = headers[i];
+        kp->vtable = &vtable_string;
+
         MokshaAny *vp = parse_and_box_literal(start, len, true);
         moksha_rt_map_insert(map, kp, vp);
+        moksha_rt_release(kp);
+        moksha_rt_release(vp);
 
         if (*p == '"')
           p++;
@@ -975,9 +1224,15 @@ MokshaAnyRet moksha_file_readCsv(char *path) {
           p++;
         int len = p - start;
 
-        MokshaAny *kp = moksha_box_string(headers[i]);
+        moksha_rt_retain(headers[i]);
+        MokshaAny *kp = (MokshaAny *)moksha_rt_alloc(sizeof(MokshaAny), 19);
+        kp->data = headers[i];
+        kp->vtable = &vtable_string;
+
         MokshaAny *vp = parse_and_box_literal(start, len, false);
         moksha_rt_map_insert(map, kp, vp);
+        moksha_rt_release(kp);
+        moksha_rt_release(vp);
       }
 
       if (*p == ',')
@@ -987,8 +1242,9 @@ MokshaAnyRet moksha_file_readCsv(char *path) {
     if (count >= cap) {
       cap *= 2;
       MokshaAny *new_arr =
-          (MokshaAny *)moksha_rt_alloc(cap * sizeof(MokshaAny), 18);
+          (MokshaAny *)moksha_mem_alloc(cap * sizeof(MokshaAny));
       memcpy(new_arr, arr, count * sizeof(MokshaAny));
+      moksha_mem_free(arr);
       arr = new_arr;
     }
 
@@ -1004,29 +1260,32 @@ MokshaAnyRet moksha_file_readCsv(char *path) {
       p++;
   }
 
+  for (int i = 0; i < cols; i++) {
+    moksha_rt_release(headers[i]);
+  }
+
   free(text);
 
-  // Single-box array return ABI
   MokshaSlice *slice = (MokshaSlice *)moksha_rt_alloc(sizeof(MokshaSlice), 18);
   slice->data = arr;
   slice->length = count;
 
-  return moksha_pack_any(slice, &vtable_array);
+  out_any->data = slice;
+  out_any->vtable = &vtable_array_any;
 }
 
 /** @brief PDF endpoints (Mock for demo) */
 
-MokshaAnyRet moksha_file_createPdf(char *path) {
-  MokshaAnyRet ret = moksha_file_open(path, 2 | 16 | 32);
-  MokshaAny temp = {(void *)(uintptr_t)ret,
-                    (const AnyVTable *)(uintptr_t)(ret >> 64)};
-  int fd = unbox_fd(&temp);
+void moksha_file_createPdf(MokshaAny *out_any, char *path) {
+  if (!out_any)
+    return;
+  moksha_file_open(out_any, path, 2 | 16 | 32);
+  int fd = unbox_fd(out_any);
 
   if (fd >= 0) {
     const char *magic = "%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
     write(fd, magic, strlen(magic));
   }
-  return ret;
 }
 
 void moksha_file_writePdfText(MokshaAny *pdf_any, char *text) {
@@ -1035,13 +1294,14 @@ void moksha_file_writePdfText(MokshaAny *pdf_any, char *text) {
 
 void moksha_file_savePdf(MokshaAny *pdf_any) { moksha_file_close(pdf_any); }
 
-MokshaAnyRet moksha_file_openPdf(char *path) {
-  return moksha_file_open(path, 1);
+void moksha_file_openPdf(MokshaAny *out_any, char *path) {
+  moksha_file_open(out_any, path, 1);
 }
 
 char *moksha_file_extractText(MokshaAny *pdf_any) {
-  MokshaAnyRet result_ret = moksha_file_read(pdf_any);
-  char *raw_buffer = (char *)(uintptr_t)result_ret;
+  MokshaAny result_any;
+  moksha_file_read(&result_any, pdf_any);
+  char *raw_buffer = (char *)result_any.data;
 
   if (!raw_buffer)
     return NULL;
@@ -1135,21 +1395,28 @@ bool moksha_file_removeDir(char *path) {
   return rmdir(path) == 0;
 }
 
-MokshaAnyRet moksha_file_listDir(char *path) {
-  if (!path)
-    return moksha_pack_any(NULL, NULL);
+void moksha_file_listDir(MokshaAny *out_any, char *path) {
+  if (!out_any)
+    return;
+  if (!path) {
+    out_any->data = NULL;
+    out_any->vtable = NULL;
+    return;
+  }
 
   DIR *dir = opendir(path);
   if (!dir) {
     MokshaSlice *empty = (MokshaSlice *)moksha_rt_alloc(sizeof(MokshaSlice), 2);
     empty->data = NULL;
     empty->length = 0;
-    return moksha_pack_any(empty, &vtable_array);
+    out_any->data = empty;
+    out_any->vtable = &vtable_array;
+    return;
   }
 
   size_t cap = 16;
   size_t len = 0;
-  char **arr = (char **)moksha_rt_alloc(cap * sizeof(char *), 2);
+  char **arr = (char **)moksha_mem_alloc(cap * sizeof(char *));
 
   struct dirent *ent;
   while ((ent = readdir(dir)) != NULL) {
@@ -1158,8 +1425,9 @@ MokshaAnyRet moksha_file_listDir(char *path) {
     }
     if (len >= cap) {
       cap *= 2;
-      char **new_arr = (char **)moksha_rt_alloc(cap * sizeof(char *), 2);
+      char **new_arr = (char **)moksha_mem_alloc(cap * sizeof(char *));
       memcpy(new_arr, arr, len * sizeof(char *));
+      moksha_mem_free(arr);
       arr = new_arr;
     }
     size_t name_len = strlen(ent->d_name);
@@ -1170,7 +1438,9 @@ MokshaAnyRet moksha_file_listDir(char *path) {
   MokshaSlice *slice = (MokshaSlice *)moksha_rt_alloc(sizeof(MokshaSlice), 2);
   slice->data = arr;
   slice->length = len;
-  return moksha_pack_any(slice, &vtable_array);
+
+  out_any->data = slice;
+  out_any->vtable = &vtable_array_string;
 }
 
 #endif

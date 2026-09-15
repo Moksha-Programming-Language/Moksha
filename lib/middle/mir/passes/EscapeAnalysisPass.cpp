@@ -1,5 +1,6 @@
 #include "moksha/MIR/Passes/EscapeAnalysisPass.h"
 #include "moksha/HIR/HIRType.h"
+#include "moksha/MIR/MIRArgument.h"
 #include "moksha/MIR/MIRBlock.h"
 #include "moksha/MIR/MIRFunction.h"
 #include "moksha/MIR/MIRInst.h"
@@ -12,7 +13,6 @@
 namespace moksha {
 namespace mir {
 
-// Helper to swap BitCast uses with the new Alloca
 static void replaceAllUsesInFunction(MIRFunction *F, MIRValue *oldVal,
                                      MIRValue *newVal) {
   for (auto &blockPtr : F->getBlocks()) {
@@ -61,7 +61,6 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
         for (auto *arg : call->getArgs())
           defUse[arg].push_back(inst);
 
-        // Track Heap Allocations
         if (call->getCallee() &&
             call->getCallee()->getName() == "__moksha_alloc") {
           bool isArray = false;
@@ -73,7 +72,6 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
               }
             }
           }
-
           if (!isArray) {
             allocations.push_back(call);
           }
@@ -93,6 +91,8 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
       } else if (auto *storeWk = llvm::dyn_cast_or_null<StoreWeakInst>(inst)) {
         defUse[storeWk->getValue()].push_back(inst);
         defUse[storeWk->getPointer()].push_back(inst);
+      } else if (auto *loadWk = llvm::dyn_cast_or_null<LoadWeakInst>(inst)) {
+        defUse[loadWk->getPointer()].push_back(inst);
       } else if (auto *arc = llvm::dyn_cast_or_null<ARCInst>(inst)) {
         defUse[arc->getObject()].push_back(inst);
       } else if (auto *ret = llvm::dyn_cast_or_null<ReturnInst>(inst)) {
@@ -112,47 +112,24 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
 
   // 2. Analyze each allocation to see if it escapes
   for (CallInst *alloc : allocations) {
-    if (!doesEscape(alloc, defUse)) {
-      bool hasARCUses = false;
-      std::vector<MIRInst *> worklist;
-      std::unordered_set<MIRInst *> visited;
+    bool isEnv = false;
+    const hir::HIRType *envPtrTy = nullptr;
 
-      for (auto *user : defUse[alloc]) {
-        worklist.push_back(user);
-      }
-
-      while (!worklist.empty()) {
-        MIRInst *curr = worklist.back();
-        worklist.pop_back();
-
-        if (!visited.insert(curr).second)
-          continue;
-
-        if (llvm::isa<ARCInst>(curr)) {
-          hasARCUses = true;
-          break;
-        }
-
-        // Trace through any instruction that aliases the memory
-        if (llvm::isa<CastInst>(curr) || llvm::isa<GetElementPtrInst>(curr) ||
-            llvm::isa<StoreInst>(curr) || llvm::isa<InsertValueInst>(curr) ||
-            llvm::isa<ExtractValueInst>(curr)) {
-          for (auto *nextUser : defUse[curr]) {
-            worklist.push_back(nextUser);
-          }
-        }
-      }
-
-      if (hasARCUses)
-        continue;
-
-      std::vector<CastInst *> bitcasts;
+    std::vector<CastInst *> bitcasts;
+    if (defUse.count(alloc)) {
       for (auto *user : defUse[alloc]) {
         if (auto *cast = llvm::dyn_cast_or_null<CastInst>(user)) {
           bitcasts.push_back(cast);
+          if (cast->getType() && cast->getType()->toString().find(
+                                     "Env.lambda") != std::string::npos) {
+            isEnv = true;
+            envPtrTy = cast->getType();
+          }
         }
       }
+    }
 
+    if (!doesEscape(alloc, defUse)) {
       if (bitcasts.empty())
         continue;
 
@@ -207,6 +184,7 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
       }
 
       std::vector<MIRInst *> freeCalls;
+      std::vector<MIRInst *> closureReleaseCalls; // ADD THIS
 
       for (auto *bc : bitcasts) {
         if (defUse.count(bc)) {
@@ -215,36 +193,50 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
               if (call->getCallee() &&
                   call->getCallee()->getName() == "__moksha_free") {
                 freeCalls.push_back(call);
+              } else if (call->getCallee() &&
+                         call->getCallee()->getName() ==
+                             "moksha_rt_release_closure_env") {
+                closureReleaseCalls.push_back(call); // Catch closure releases
               }
             } else if (auto *invoke =
                            llvm::dyn_cast_or_null<InvokeInst>(user)) {
               if (invoke->getCallee() &&
                   invoke->getCallee()->getName() == "__moksha_free") {
                 freeCalls.push_back(invoke);
+              } else if (invoke->getCallee() &&
+                         invoke->getCallee()->getName() ==
+                             "moksha_rt_release_closure_env") {
+                closureReleaseCalls.push_back(invoke); // Catch closure invokes
               }
             }
           }
         }
       }
 
-      // Sweep frees directly on the raw alloc
       if (defUse.count(alloc)) {
         for (auto *user : defUse[alloc]) {
           if (auto *call = llvm::dyn_cast_or_null<CallInst>(user)) {
             if (call->getCallee() &&
                 call->getCallee()->getName() == "__moksha_free") {
               freeCalls.push_back(call);
+            } else if (call->getCallee() &&
+                       call->getCallee()->getName() ==
+                           "moksha_rt_release_closure_env") {
+              closureReleaseCalls.push_back(call);
             }
           } else if (auto *invoke = llvm::dyn_cast_or_null<InvokeInst>(user)) {
             if (invoke->getCallee() &&
                 invoke->getCallee()->getName() == "__moksha_free") {
               freeCalls.push_back(invoke);
+            } else if (invoke->getCallee() &&
+                       invoke->getCallee()->getName() ==
+                           "moksha_rt_release_closure_env") {
+              closureReleaseCalls.push_back(invoke);
             }
           }
         }
       }
 
-      // Erase all found frees
       for (MIRInst *freeCall : freeCalls) {
         auto &freeInsts = freeCall->getParent()->getInstructionsMut();
         freeInsts.erase(std::remove_if(freeInsts.begin(), freeInsts.end(),
@@ -254,7 +246,28 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
                         freeInsts.end());
       }
 
-      // 5. Hard Erase the original Allocation
+      if (!closureReleaseCalls.empty()) {
+        std::string dtorOnlyName = "moksha_rt_execute_closure_dtor_only";
+        MIRFunction *dtorOnlyFunc = M.getFunction(dtorOnlyName);
+        if (!dtorOnlyFunc) {
+          MIRFunction *existingRel =
+              M.getFunction("moksha_rt_release_closure_env");
+          auto fn = std::make_unique<MIRFunction>(
+              existingRel->getType(), dtorOnlyName, Linkage::External);
+          fn->addArgument(std::make_unique<MIRArgument>(
+              fn.get(), existingRel->getRawArguments()[0]->getType(), 0));
+          dtorOnlyFunc = fn.get();
+          M.addFunction(std::move(fn));
+        }
+        for (MIRInst *relCall : closureReleaseCalls) {
+          if (auto *c = llvm::dyn_cast_or_null<CallInst>(relCall)) {
+            c->replaceOperand(c->getCallee(), dtorOnlyFunc);
+          } else if (auto *i = llvm::dyn_cast_or_null<InvokeInst>(relCall)) {
+            i->replaceOperand(i->getCallee(), dtorOnlyFunc);
+          }
+        }
+      }
+
       auto &allocInsts = alloc->getParent()->getInstructionsMut();
       allocInsts.erase(std::remove_if(allocInsts.begin(), allocInsts.end(),
                                       [&](const std::unique_ptr<MIRInst> &i) {
@@ -263,6 +276,16 @@ bool EscapeAnalysisPass::runOnFunction(MIRFunction *F, MIRModule &M) {
                        allocInsts.end());
 
       changed = true;
+    } else if (isEnv) {
+      if (alloc->getArgs().size() > 1) {
+        auto *typeArg = alloc->getArgs()[1];
+        MIRValue *newTypeId =
+            M.getOrInsertConstant<ConstantInt>(21, typeArg->getType());
+        auto &mutableArgs =
+            const_cast<std::vector<MIRValue *> &>(alloc->getArgs());
+        mutableArgs[1] = newTypeId;
+        changed = true;
+      }
     }
   }
 
@@ -287,46 +310,72 @@ bool EscapeAnalysisPass::doesEscape(
       continue;
 
     for (MIRInst *user : it->second) {
-      if (auto *store = llvm::dyn_cast_or_null<StoreInst>(user)) {
-        if (store->getValue() == curr)
-          return true;
+      if (auto *storeWk = llvm::dyn_cast_or_null<StoreWeakInst>(user)) {
+        if (storeWk->getValue() == curr) {
+          if (auto *alloca =
+                  llvm::dyn_cast_or_null<AllocaInst>(storeWk->getPointer())) {
+            worklist.push_back(alloca);
+          } else {
+            return true;
+          }
+        }
+      } else if (auto *store = llvm::dyn_cast_or_null<StoreInst>(user)) {
+        if (store->getValue() == curr) {
+          if (auto *alloca =
+                  llvm::dyn_cast_or_null<AllocaInst>(store->getPointer())) {
+            worklist.push_back(alloca);
+          } else {
+            return true;
+          }
+        }
       } else if (auto *call = llvm::dyn_cast_or_null<CallInst>(user)) {
         if (call->getCallee() &&
-            call->getCallee()->getName() != "__moksha_alloc" &&
-            call->getCallee()->getName() != "__moksha_free") {
+            (call->getCallee()->getName() == "__moksha_alloc" ||
+             call->getCallee()->getName() == "__moksha_free" ||
+             call->getCallee()->getName().find("lambda.") == 0 ||
+             call->getCallee()->getName().find("Closure.lambda.") == 0 ||
+             call->getCallee()->getName().find(".destructor_ret_void") !=
+                 std::string::npos)) {
+        } else {
           return true;
         }
       } else if (auto *invoke = llvm::dyn_cast_or_null<InvokeInst>(user)) {
         if (invoke->getCallee() &&
-            invoke->getCallee()->getName() != "__moksha_alloc" &&
-            invoke->getCallee()->getName() != "__moksha_free") {
+            (invoke->getCallee()->getName() == "__moksha_alloc" ||
+             invoke->getCallee()->getName() == "__moksha_free" ||
+             invoke->getCallee()->getName().find("lambda.") == 0 ||
+             invoke->getCallee()->getName().find("Closure.lambda.") == 0 ||
+             invoke->getCallee()->getName().find(".destructor_ret_void") !=
+                 std::string::npos)) {
+        } else {
           return true;
         }
-      } else if (llvm::isa<ReturnInst>(user)) {
-        return true;
+      } else if (auto *load = llvm::dyn_cast_or_null<LoadInst>(user)) {
+        worklist.push_back(load);
+      } else if (auto *loadWk = llvm::dyn_cast_or_null<LoadWeakInst>(user)) {
+        worklist.push_back(loadWk);
+      } else if (llvm::isa<ARCInst>(user)) {
       } else if (auto *gep = llvm::dyn_cast_or_null<GetElementPtrInst>(user)) {
         worklist.push_back(gep);
       } else if (auto *cast = llvm::dyn_cast_or_null<CastInst>(user)) {
         worklist.push_back(cast);
       } else if (auto *ext = llvm::dyn_cast_or_null<ExtractValueInst>(user)) {
-        if (ext->getIndex() == 0) {
+        if (ext->getIndex() == 0)
           worklist.push_back(ext);
-        }
       } else if (auto *ins = llvm::dyn_cast_or_null<InsertValueInst>(user)) {
         worklist.push_back(ins);
       } else if (auto *makeClosure =
                      llvm::dyn_cast_or_null<MakeClosureInst>(user)) {
         worklist.push_back(makeClosure);
-      } else if (llvm::isa<MakeSharedInst>(user)) {
-        return true;
-      } else if (llvm::isa<SpawnInst>(user)) {
+      } else if (llvm::isa<ReturnInst>(user) ||
+                 llvm::isa<MakeSharedInst>(user) ||
+                 llvm::isa<SpawnInst>(user)) {
         return true;
       } else {
         return true;
       }
     }
   }
-
   return false;
 }
 

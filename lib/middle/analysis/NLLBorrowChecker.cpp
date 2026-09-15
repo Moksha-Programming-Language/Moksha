@@ -392,7 +392,9 @@ void NLLBorrowChecker::computeDataflow(MIRFunction *func) {
           if (isActualMove) {
             std::vector<Place> srcPlaces = resolvePlace(load->getPointer());
             for (const Place &src : srcPlaces) {
-              if (src.base && llvm::isa<AllocaInst>(src.base)) {
+              if (src.base && (llvm::isa<AllocaInst>(src.base) ||
+                               llvm::isa<MIRGlobal>(src.base) ||
+                               llvm::isa<MIRArgument>(src.base))) {
                 Loan moveLoan{src, nullptr, true};
                 if (std::find(currentLoans.begin(), currentLoans.end(),
                               moveLoan) == currentLoans.end()) {
@@ -672,7 +674,9 @@ void NLLBorrowChecker::computeDataflow(MIRFunction *func) {
 
             std::vector<Place> srcPlaces = resolvePlace(tracedCap);
             for (const Place &src : srcPlaces) {
-              if (src.base && llvm::isa<AllocaInst>(src.base)) {
+              if (src.base && (llvm::isa<AllocaInst>(src.base) ||
+                               llvm::isa<MIRGlobal>(src.base) ||
+                               llvm::isa<MIRArgument>(src.base))) {
                 Loan newLoan{src, isMoveType(cap) ? nullptr : makeClosure,
                              isMoveType(cap)
                                  ? true
@@ -724,7 +728,9 @@ void NLLBorrowChecker::computeDataflow(MIRFunction *func) {
                 if (isPointerType(arg)) {
                   std::vector<Place> srcPlaces = resolvePlace(arg);
                   for (const Place &src : srcPlaces) {
-                    if (src.base && llvm::isa<AllocaInst>(src.base)) {
+                    if (src.base && (llvm::isa<AllocaInst>(src.base) ||
+                                     llvm::isa<MIRGlobal>(src.base) ||
+                                     llvm::isa<MIRArgument>(src.base))) {
                       Loan newLoan{src, call, isExclusiveBorrow(call)};
                       if (std::find(currentLoans.begin(), currentLoans.end(),
                                     newLoan) == currentLoans.end()) {

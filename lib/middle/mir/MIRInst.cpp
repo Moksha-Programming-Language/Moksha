@@ -176,6 +176,10 @@ static std::string getOpcodeName(Opcode op) {
     return "ptrtoint";
   case Opcode::IntToPtr:
     return "inttoptr";
+  case Opcode::FPExt:
+    return "fpext";
+  case Opcode::FPTrunc:
+    return "fptrunc";
   case Opcode::AnyCast:
     return "anycast";
   case Opcode::Upcast:

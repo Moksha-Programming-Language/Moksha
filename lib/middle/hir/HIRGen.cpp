@@ -28,10 +28,14 @@ static bool isTypeMutable(const Type *t) {
       return true;
     if (llvm::isa<ViewType>(t))
       return false;
+    if (llvm::isa<ReferenceType>(t))
+      return true;
     if (auto *pt = llvm::dyn_cast_or_null<PointerType>(t))
       t = pt->getPointee();
-    else if (auto *rt = llvm::dyn_cast_or_null<ReferenceType>(t))
-      t = rt->getInner();
+    else if (auto *wt = llvm::dyn_cast_or_null<WeakType>(t))
+      t = wt->getInner();
+    else if (auto *nt = llvm::dyn_cast_or_null<NullableType>(t))
+      t = nt->getInner();
     else
       break;
   }
@@ -105,6 +109,14 @@ static hir::CastOp determineCastOp(const hir::HIRType *srcTy,
       }
     }
     return hir::CastOp::PointerCast;
+  }
+
+  // 4b. Pointer <-> Integer Conversions
+  if (srcKind == hir::TypeKind::Pointer && dstKind == hir::TypeKind::Int) {
+    return hir::CastOp::PointerToInt;
+  }
+  if (srcKind == hir::TypeKind::Int && dstKind == hir::TypeKind::Pointer) {
+    return hir::CastOp::IntToPointer;
   }
 
   // 5. Decimals & Slices
@@ -208,9 +220,10 @@ const hir::HIRType *HIRGen::lowerType(const Type *astType) {
       const hir::HIRType *innerTy = lowerType(refT->getInner());
       if (!innerTy)
         innerTy = hirModule.getVoidType();
-
-      return hirModule.getPointerType(innerTy, hir::Ownership::Borrowed,
-                                      accumulatedState);
+      hir::BorrowState state = (accumulatedState == hir::BorrowState::None)
+                                   ? hir::BorrowState::Mut
+                                   : accumulatedState;
+      return hirModule.getPointerType(innerTy, hir::Ownership::Borrowed, state);
     }
 
     // Handle Pointers
@@ -535,6 +548,7 @@ void HIRGen::visitClassDecl(const ClassDecl *decl) {
   std::vector<std::string> fieldNames;
   std::vector<std::unique_ptr<hir::HIRStmt>> fieldInitStmts;
   bool hasConstructor = false;
+  bool hasDestructor = false;
   bool parentHasVTable = false;
 
   for (const auto &pName : decl->getParentNames()) {
@@ -593,6 +607,8 @@ void HIRGen::visitClassDecl(const ClassDecl *decl) {
                    llvm::dyn_cast_or_null<FunctionDecl>(member.get())) {
       if (fnDecl->getName() == "constructor") {
         hasConstructor = true;
+      } else if (fnDecl->getName() == "destructor") {
+        hasDestructor = true;
       }
 
       fnDecl->accept(*this);
@@ -638,6 +654,21 @@ void HIRGen::visitClassDecl(const ClassDecl *decl) {
         false, false, "", decl->getLoc());
 
     methods.push_back(std::move(defaultCtor));
+  }
+
+  // Synthesize a Default Destructor if none exists
+  if (!hasDestructor) {
+    auto emptyBody = std::make_unique<hir::BlockStmt>(
+        std::vector<std::unique_ptr<hir::HIRStmt>>{}, decl->getLoc());
+    std::vector<hir::HIRGenericParam> emptyTypeParams;
+    std::vector<hir::HIRParam> emptyParams;
+
+    auto defaultDtor = std::make_unique<hir::HIRFunction>(
+        "destructor", std::move(emptyTypeParams), std::move(emptyParams),
+        hirModule.getVoidType(), std::move(emptyBody), false, false, false,
+        false, false, "", decl->getLoc());
+
+    methods.push_back(std::move(defaultDtor));
   }
 
   // 3. Populate the opaque Struct/Union with the extracted layout

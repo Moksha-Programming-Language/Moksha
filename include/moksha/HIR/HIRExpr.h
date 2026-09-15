@@ -58,6 +58,8 @@ enum class CastOp {
   FloatExtend,   // Float widening (e.g., quarter -> half -> float -> double)
   FloatTruncate, // Float narrowing (e.g., double -> float)
   PointerCast,
+  PointerToInt,
+  IntToPointer,
   AnyCast,
   Upcast
 };

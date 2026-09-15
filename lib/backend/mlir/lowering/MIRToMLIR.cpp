@@ -135,6 +135,10 @@ private:
                    ::llvm::dyn_cast_or_null<mir::ConstantDecimal>(constant)) {
       return builder.getStringAttr(decConst->getValue());
     } else if (::llvm::isa<mir::ConstantNull>(constant)) {
+      if (::mlir::Attribute zeroAttr =
+              builder.getZeroAttr(getMLIRType(constant->getType()))) {
+        return zeroAttr;
+      }
       return builder.getUnitAttr();
     } else if (auto *arrConst =
                    ::llvm::dyn_cast_or_null<mir::ConstantArray>(constant)) {
@@ -182,20 +186,10 @@ private:
                    ::llvm::dyn_cast_or_null<mir::ConstantStruct>(constant)) {
       llvm::SmallVector<::mlir::Attribute, 4> elements;
       for (mir::MIRValue *elem : structConst->getFields()) {
-        if (elem && elem->getType() &&
-            elem->getType()->getKind() == hir::TypeKind::Pointer) {
-          if (auto *global = ::llvm::dyn_cast_or_null<mir::MIRGlobal>(elem)) {
-            elements.push_back(::mlir::FlatSymbolRefAttr::get(
-                builder.getContext(), global->getName()));
-          } else if (auto *func =
-                         ::llvm::dyn_cast_or_null<mir::MIRFunction>(elem)) {
-            elements.push_back(::mlir::FlatSymbolRefAttr::get(
-                builder.getContext(), func->getName()));
-          } else {
-            elements.push_back(builder.getUnitAttr());
-          }
-        } else {
+        if (elem) {
           elements.push_back(getAttributeForValue(elem));
+        } else {
+          elements.push_back(builder.getUnitAttr());
         }
       }
       return builder.getArrayAttr(elements);
@@ -566,6 +560,10 @@ private:
           llvm::errs() << "\nIn Function: " << func->getName() << "\n";
           return ::mlir::failure();
         }
+        if (!blockMap[block]->empty() &&
+            blockMap[block]->back().hasTrait<::mlir::OpTrait::IsTerminator>()) {
+          break;
+        }
       }
     }
     return ::mlir::success();
@@ -574,11 +572,20 @@ private:
   void lowerGlobal(mir::MIRGlobal *global) {
     auto loc = builder.getUnknownLoc();
     auto type = getMLIRType(global->getType());
+
     ::mlir::Attribute initAttr = nullptr;
     if (mir::MIRConstant *initVal = global->getInitializer()) {
       initAttr = getConstantAttribute(initVal);
-    } else {
-      initAttr = builder.getUnitAttr();
+    }
+
+    // Attempt to promote missing or typeless attributes to a strictly-typed
+    // zero attribute.
+    if (!initAttr || ::llvm::isa<::mlir::UnitAttr>(initAttr)) {
+      if (::mlir::Attribute zeroAttr = builder.getZeroAttr(type)) {
+        initAttr = zeroAttr; // Success for standard types (i32, f32, f64, etc.)
+      } else {
+        initAttr = builder.getUnitAttr();
+      }
     }
 
     auto globalOp = builder.create<::moksha::IR::GlobalOp>(
@@ -726,13 +733,21 @@ private:
       break;
     }
 
-    // Memory Ops
+      // Memory Ops
     case mir::Opcode::Alloca: {
       auto *alloca = static_cast<mir::AllocaInst *>(inst);
       ::mlir::Type elemType = getMLIRType(alloca->getAllocatedType());
+
+      // Unconditionally hoist all allocas to the function's entry block
+      ::mlir::OpBuilder::InsertionGuard guard(builder);
+      ::mlir::Block *entryBlock =
+          &builder.getInsertionBlock()->getParent()->front();
+      builder.setInsertionPointToStart(entryBlock);
+
       auto mlirAlloca = builder.create<::moksha::IR::AllocaOp>(
           loc, ::moksha::IR::PointerType::get(&context, elemType),
           ::mlir::TypeAttr::get(elemType));
+
       if (alloca->getAlignment() > 0) {
         mlirAlloca->setAttr("alignment",
                             builder.getI32IntegerAttr(alloca->getAlignment()));
@@ -910,6 +925,29 @@ private:
     }
 
     // Casts
+    case mir::Opcode::FPExt: {
+      auto *castInst = static_cast<mir::CastInst *>(inst);
+      ::mlir::Value val = getValue(castInst->getValue());
+      if (!val)
+        return ::mlir::failure();
+
+      ::mlir::Type resType = getMLIRType(castInst->getType());
+      auto mlirExt = builder.create<::moksha::IR::FPExtOp>(loc, resType, val);
+      valueMap[inst] = mlirExt.getResult();
+      break;
+    }
+    case mir::Opcode::FPTrunc: {
+      auto *castInst = static_cast<mir::CastInst *>(inst);
+      ::mlir::Value val = getValue(castInst->getValue());
+      if (!val)
+        return ::mlir::failure();
+
+      ::mlir::Type resType = getMLIRType(castInst->getType());
+      auto mlirTrunc =
+          builder.create<::moksha::IR::FPTruncOp>(loc, resType, val);
+      valueMap[inst] = mlirTrunc.getResult();
+      break;
+    }
     case mir::Opcode::IntToFloat:
     case mir::Opcode::FloatToInt:
     case mir::Opcode::Trunc:

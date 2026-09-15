@@ -46,3 +46,6 @@ Thumbs.db
 
 #Baremetal Runtimes
 build_baremetal_*
+combined*.mox
+script.ps1
+test.mox

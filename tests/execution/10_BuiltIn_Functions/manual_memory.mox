@@ -156,9 +156,8 @@ void test_pointer_to_pointer() {
 void test_linked_list_nodes() {
     println("Running test_linked_list_nodes...")
     unsafe {
-        // Allocate two nodes independently
-        *mut Node head = cast<*mut Node>(malloc(sizeof(Node)))
-        *mut Node second = cast<*mut Node>(malloc(sizeof(Node)))
+        *mut Node head = cast<*mut Node>(calloc(1, sizeof(Node)))
+        *mut Node second = cast<*mut Node>(calloc(1, sizeof(Node)))
 
         // Link them up
         (*head).data = 100

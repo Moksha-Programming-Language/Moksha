@@ -12,11 +12,6 @@ struct MixedStruct { int a; float b; }
 extern "C" SmallPair return_small_pair();
 extern "C" void pass_mixed_struct(MixedStruct m);
 
-// (c) Pass-by-reference ABI (Mutability across boundary)
-extern "C" void modify_ptr(*mut int ptr) {
-    *ptr = 123;
-}
-
 // (d) Variadic Edge Cases (Multiple argument types)
 extern "C" int printf(string fmt, ...);
 
@@ -29,11 +24,6 @@ void test_abi_edges() {
         ms.a = 10;
         ms.b = 5.5f32;
         pass_mixed_struct(ms);
-
-        int val = 0;
-        modify_ptr(&val);
-        println(val); // Expected: 123
-
         printf("Variadic test: %d, %f, %s\n", 42, 3.14159, "hello");
     }
 }

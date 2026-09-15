@@ -16,4 +16,4 @@ async void fetch_data() {
 }
 
 // Kick off the coroutine. The scheduler will flush it before the program exits.
-fetch_data();
+await fetch_data();

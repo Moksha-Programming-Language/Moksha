@@ -77,32 +77,6 @@ typedef struct {
   const AnyVTable *vtable; // Pointer to the type's specific VTable
 } MokshaAny;
 
-#if defined(__SIZEOF_INT128__)
-typedef unsigned __int128 MokshaAnyRet;
-
-static inline MokshaAnyRet moksha_pack_any(void *data,
-                                           const AnyVTable *vtable) {
-  MokshaAnyRet ret = 0;
-  ret = (MokshaAnyRet)(uintptr_t)vtable;
-  ret <<= 64;
-  ret |= (MokshaAnyRet)(uintptr_t)data;
-  return ret;
-}
-#else
-typedef struct {
-  uint64_t data;
-  uint64_t vtable;
-} MokshaAnyRet;
-
-static inline MokshaAnyRet moksha_pack_any(void *data,
-                                           const AnyVTable *vtable) {
-  MokshaAnyRet ret;
-  ret.data = (uint64_t)(uintptr_t)data;
-  ret.vtable = (uint64_t)(uintptr_t)vtable;
-  return ret;
-}
-#endif
-
 // Fallback for bare-metal (missing libgcc division) or 32-bit archs
 #if defined(__SIZEOF_INT128__) && !defined(__MOKSHA_BAREMETAL__)
 typedef __int128 moksha_int128_t;
@@ -172,7 +146,9 @@ MokshaDecimal __moksha_parse_decimal(const char *input_str);
 // ============================================================================
 void *moksha_rt_alloc(size_t payload_size, uint32_t type_id);
 void moksha_rt_retain(void *ptr);
+void moksha_rt_release_closure_env(void *env_ptr);
 void moksha_rt_release_with_dtor(void *ptr, void (*dtor)(void *));
+void moksha_rt_execute_closure_dtor_only(void *env_ptr);
 void moksha_rt_release(void *ptr);
 void moksha_rt_store_weak(void **dest, void *obj);
 void *moksha_rt_load_weak(void **src);
@@ -236,27 +212,28 @@ bool __moksha_array_eq(void *a_ptr, int32_t a_len, void *b_ptr, int32_t b_len,
                        int32_t elem_size);
 
 // Type to String Conversions
-char *__moksha_bool_to_string(bool val);
-char *__moksha_char_to_string(int8_t val);
-char *__moksha_uchar_to_string(uint8_t val);
-char *__moksha_short_to_string(int16_t val);
-char *__moksha_ushort_to_string(uint16_t val);
-char *__moksha_int_to_string(int32_t val);
-char *__moksha_uint_to_string(uint32_t val);
-char *__moksha_long_to_string(int64_t val);
-char *__moksha_ulong_to_string(uint64_t val);
-char *__moksha_isize_to_string(intptr_t val);
-char *__moksha_usize_to_string(size_t val);
-char *__moksha_quarter_to_string(float val); // f8
-char *__moksha_half_to_string(float val);    // f16
-char *__moksha_float_to_string(float val);   // f32
-char *__moksha_double_to_string(double val); // f64
+char *__moksha_bool_to_string(void *ptr);
+char *__moksha_char_to_string(void *ptr);
+char *__moksha_uchar_to_string(void *ptr);
+char *__moksha_short_to_string(void *ptr);
+char *__moksha_ushort_to_string(void *ptr);
+char *__moksha_int_to_string(void *ptr);
+char *__moksha_uint_to_string(void *ptr);
+char *__moksha_long_to_string(void *ptr);
+char *__moksha_ulong_to_string(void *ptr);
+char *__moksha_isize_to_string(void *ptr);
+char *__moksha_usize_to_string(void *ptr);
+char *__moksha_quarter_to_string(void *ptr); // f8
+char *__moksha_half_to_string(void *ptr);    // f16
+char *__moksha_float_to_string(void *ptr);   // f32
+char *__moksha_double_to_string(void *ptr);  // f64
 char *__moksha_half_to_string_abi(float val);
 char *__moksha_quarter_to_string_abi(float val);
 char *moksha_rt_dec_to_string(MokshaDecimal *dec);
 char *__moksha_ptr_to_string(void *ptr);
+char *__moksha_null_to_string(void *ptr);
 char *__moksha_cstr_to_string(const char *cstr);
-char *__moksha_any_to_string(MokshaAny *any_val);
+char *__moksha_any_to_string(void *ptr);
 void moksha_print_decimal128(moksha_int128_t value, int scale);
 
 // ============================================================================
@@ -297,10 +274,13 @@ void *moksha_rt_map_new(void);
 void moksha_rt_map_insert(void *map_ptr, MokshaAny *key, MokshaAny *value);
 MokshaAny *moksha_rt_map_get_key_at(void *map_ptr, int32_t index);
 MokshaAny *moksha_rt_map_get_val_at(void *map_ptr, int32_t index);
+void *moksha_rt_map_get_val_ptr_at(void *map_ptr, int32_t index);
 MokshaAny *moksha_rt_map_get(void *map_ptr, MokshaAny *key);
 MokshaAny *moksha_rt_any_get(MokshaAny *container, MokshaAny *key);
 int32_t moksha_rt_map_len(void *map_ptr);
 void moksha_rt_map_free_internal(void *map_ptr);
+void *moksha_rt_map_get_or_create(void *map_ptr, MokshaAny *key,
+                                  size_t val_size, uint32_t val_type_id);
 
 // Map built-in functions
 bool moksha_rt_map_has(void *map_ptr, MokshaAny *key);
@@ -321,11 +301,11 @@ MokshaAny *moksha_box_array(MokshaSlice *slice);
 // ============================================================================
 // File System & IO Builtins
 // ============================================================================
-MokshaAnyRet moksha_file_open(char *path, int32_t mode);
+void moksha_file_open(MokshaAny *out_any, char *path, int32_t mode);
 void moksha_file_close(MokshaAny *file_any);
 int32_t moksha_rt_any_len(MokshaAny *any_val);
 void moksha_file_write(MokshaAny *file_any, MokshaAny *data_any);
-MokshaAnyRet moksha_file_read(MokshaAny *file_any);
+void moksha_file_read(MokshaAny *out_any, MokshaAny *file_any);
 
 bool moksha_file_exists(char *path);
 int64_t moksha_file_size(MokshaAny *file_any);
@@ -338,7 +318,7 @@ void moksha_file_truncate(MokshaAny *file_any, int64_t size);
 
 void moksha_file_writeLine(MokshaAny *file_any, char *text);
 char *moksha_file_readLine(MokshaAny *file_any);
-MokshaAnyRet moksha_file_readLines(MokshaAny *file_any);
+void moksha_file_readLines(MokshaAny *out_any, MokshaAny *file_any);
 
 void moksha_file_writeText(char *path, char *text);
 void moksha_file_appendText(char *path, char *text);
@@ -346,20 +326,20 @@ char *moksha_file_readText(char *path);
 
 void moksha_file_writeBytes(char *path, MokshaAny *data_any);
 void moksha_file_appendBytes(char *path, MokshaAny *data_any);
-MokshaAnyRet moksha_file_readBytes(char *path);
+void moksha_file_readBytes(MokshaAny *out_any, char *path);
 
 void moksha_file_writeJson(char *path, MokshaAny *data_any);
-MokshaAnyRet moksha_file_readJson(char *path);
+void moksha_file_readJson(MokshaAny *out_any, char *path);
 void moksha_file_writeYaml(char *path, MokshaAny *data_any);
-MokshaAnyRet moksha_file_readYaml(char *path);
+void moksha_file_readYaml(MokshaAny *out_any, char *path);
 
 void moksha_file_writeCsv(char *path, MokshaAny *data_any);
-MokshaAnyRet moksha_file_readCsv(char *path);
+void moksha_file_readCsv(MokshaAny *out_any, char *path);
 
-MokshaAnyRet moksha_file_createPdf(char *path);
+void moksha_file_createPdf(MokshaAny *out_any, char *path);
 void moksha_file_writePdfText(MokshaAny *pdf_any, char *text);
 void moksha_file_savePdf(MokshaAny *pdf_any);
-MokshaAnyRet moksha_file_openPdf(char *path);
+void moksha_file_openPdf(MokshaAny *out_any, char *path);
 char *moksha_file_extractText(MokshaAny *pdf_any);
 
 bool moksha_file_createDir(char *path);
@@ -367,7 +347,7 @@ bool moksha_file_isDir(char *path);
 bool moksha_file_isFile(char *path);
 bool moksha_file_copy(char *src, char *dst);
 bool moksha_file_move(char *src, char *dst);
-MokshaAnyRet moksha_file_listDir(char *path);
+void moksha_file_listDir(MokshaAny *out_any, char *path);
 bool moksha_file_remove(char *path);
 bool moksha_file_removeDir(char *path);
 

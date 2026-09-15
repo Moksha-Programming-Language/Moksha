@@ -1,0 +1,37 @@
+println("--- [E2E] string_memory_leaks.mox ---");
+println("Running continuous string memory stress test. Check Task Manager...");
+
+void test_interpolation_leak() {
+    int val = 42;
+    string msg = `Status code is ${val}`;
+    string chained_concat = "A" + "B" + "C";
+}
+
+void test_chaining_leak() {
+    string raw = "   moksha lang   ";
+    string clean = to_upper(trim(raw));
+}
+
+void test_split_orphan_leak() {
+    string csv = "apple,banana,cherry";
+    string[] parts = split(csv, ",");
+}
+
+struct MaliciousPOD {
+    int id;
+    string payload;
+}
+
+void test_pod_escape_leak() {
+    MaliciousPOD pod;
+    pod.id = 1;
+    pod.payload = to_upper("trapped in a struct");
+}
+
+// Infinite loop to rapidly trigger allocations and potential leaks
+while (true) {
+    test_chaining_leak();
+    test_interpolation_leak();
+    test_split_orphan_leak();
+    test_pod_escape_leak();
+}

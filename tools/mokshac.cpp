@@ -161,8 +161,17 @@ static cl::opt<std::string> TargetCPU("mcpu", cl::desc("Target specific CPU"),
 static cl::opt<std::string>
     TargetFeatures("mattr", cl::desc("Target specific attributes"),
                    cl::init(""), cl::cat(MokshaCategory));
-static cl::opt<bool> DisableOpt("O0", cl::desc("Disable backend optimizations"),
-                                cl::init(false), cl::cat(MokshaCategory));
+
+// Dynamic Optimization Level (e.g., -O0, -O2, -O3, -Os)
+static cl::opt<std::string>
+    OptLevel("O", cl::desc("Optimization level (e.g., 0, 1, 2, 3, s, fast)"),
+             cl::Prefix, cl::init("2"), cl::cat(MokshaCategory));
+
+// Link-Time Optimization flag
+static cl::opt<bool> EnableLTO("flto",
+                               cl::desc("Enable Link-Time Optimization"),
+                               cl::init(false), cl::cat(MokshaCategory));
+
 static cl::opt<std::string>
     Sanitize("fsanitize", cl::desc("Enable a sanitizer (e.g., address)"),
              cl::value_desc("sanitizer"), cl::init(""),
@@ -663,7 +672,16 @@ int main(int argc, char **argv) {
     config.triple = TargetTriple.empty() ? llvm::sys::getDefaultTargetTriple()
                                          : TargetTriple;
     config.features = TargetFeatures;
-    config.optLevel = DisableOpt ? 0 : 2;
+
+    // Apply optimization level from dynamic string
+    if (OptLevel == "0")
+      config.optLevel = 0;
+    else if (OptLevel == "1")
+      config.optLevel = 1;
+    else if (OptLevel == "3" || OptLevel == "fast")
+      config.optLevel = 3;
+    else
+      config.optLevel = 2; // Default for 2, s, z
 
     llvm::Triple actualTriple(config.triple);
 
@@ -739,8 +757,10 @@ int main(int argc, char **argv) {
 
         // Dynamically find the correct optimizer binary
         std::string optBinary = findLLVMTool("opt");
-        std::string optLevel = DisableOpt ? "-O0" : "-O2";
-        std::string optCmd = optBinary + " " + optLevel + " " + llFilename +
+        std::string optFlag = "-O" + OptLevel;
+        std::string ltoFlag = EnableLTO ? " -flto" : "";
+
+        std::string optCmd = optBinary + " " + optFlag + " " + llFilename +
                              " -S -o " + llFilename;
         int optResult = std::system(optCmd.c_str());
 
@@ -769,7 +789,7 @@ int main(int argc, char **argv) {
         // STEP 1: Compile LLVM IR (.ll) to Native Object File (.o)
         std::string objFilename = exeFilename + ".o";
         std::string compileCmd =
-            compilerBinary + " -c " + optLevel + asanFlags +
+            compilerBinary + " -c " + optFlag + asanFlags + ltoFlag +
             " -fno-exceptions -fno-rtti -Wno-override-module " + llFilename +
             " -o " + objFilename;
 
@@ -935,9 +955,10 @@ int main(int argc, char **argv) {
           }
         } else {
           // Standard OS Hosted Linking (Linux, Windows, Darwin, WASM)
-          std::string cmd = compilerBinary + " " + optLevel + asanFlags +
-                            " -fno-exceptions -fno-rtti -Wno-override-module " +
-                            objFilename + extraFilesStr + " " + resolvedRtLib;
+          std::string cmd =
+              compilerBinary + " " + optFlag + asanFlags + ltoFlag +
+              " -fuse-ld=lld -fno-exceptions -fno-rtti -Wno-override-module " +
+              objFilename + extraFilesStr + " " + resolvedRtLib;
 
           for (const auto &path : LibraryPaths)
             cmd += " -L" + path;

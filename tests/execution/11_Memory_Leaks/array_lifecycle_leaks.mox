@@ -1,0 +1,28 @@
+println("--- [E2E] array_lifecycle_leaks.mox ---");
+
+void test_clear_leak() {
+    string[] items = ["alpha", "beta", "gamma", "delta"];
+    clear(items);
+}
+
+void test_pop_orphan_leak() {
+    string[] items = ["first", "second", "third"];
+    string last = pop(items);
+}
+
+void test_remove_orphan_leak() {
+    string[] items = ["item_0", "item_1", "item_2"];
+    string removed = remove(items, 1);
+}
+
+void test_resize_shrink_leak() {
+    string[] items = ["one", "two", "three", "four", "five"];
+    resize(items, 2);
+}
+
+while (true) {
+    test_clear_leak();
+    test_pop_orphan_leak();
+    test_remove_orphan_leak();
+    test_resize_shrink_leak();
+}

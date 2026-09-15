@@ -1,0 +1,36 @@
+public using AnomalyCallback = (unsigned int) => void;
+
+// ==========================================
+// SCENARIO 1: THE CRASH (Raw Function)
+// Initializing with a raw C-style function allocates only 8 bytes.
+// ==========================================
+public void default_cb(unsigned int x) {}
+static AnomalyCallback g_anomaly_cb = default_cb;
+
+// ==========================================
+// SCENARIO 2: THE FIX (Lambda Closure)
+// ==========================================
+
+
+public void snn_register_callback(AnomalyCallback cb) {
+    println("  -> [1] Before assignment (String VTable is intact)");
+
+    // FATAL ASSIGNMENT: Writing a 16-byte closure into the global slot.
+    // If the slot is only 8 bytes, this overflows and corrupts the adjacent String VTable.
+    g_anomaly_cb = cb;
+
+    // If the VTable was corrupted, attempting to print this string will cause a silent SIGSEGV.
+    println("  -> [2] After assignment (If you see this, memory is safe)");
+}
+
+public void on_anomaly_detected(unsigned int x) {}
+
+void main() {
+    println("=== Running Closure ABI Mismatch Test ===");
+
+    // To fully fix the caller side, you would also wrap the argument in a lambda:
+    // snn_register_callback((unsigned int x) => { on_anomaly_detected(x); });
+    snn_register_callback(on_anomaly_detected);
+
+    println("=== Test Completed Successfully ===");
+}

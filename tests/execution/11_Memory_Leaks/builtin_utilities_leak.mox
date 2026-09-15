@@ -1,0 +1,68 @@
+println("--- [E2E] builtin_utilities_leak.mox ---");
+
+void test_all_missing_string_builtins() {
+    // 1. Transformations and Allocations
+    string base = "  moksha compiler  ";
+    string upper = to_upper(base);
+    string lower = to_lower(upper);
+    string trimmed = trim(lower);
+
+    string replaced = replace(trimmed, "compiler", "lang");
+    string sub = substring(replaced, 0, 6);
+    string slc = slice(replaced, 0, 6);
+
+    string[] tokens = split("a,b,c,d", ",");
+    string joined = join(tokens, "-");
+
+    // 2. Queries and Accessors (Ensures arguments don't leak)
+    bool has_comp = contains(base, "compiler");
+    int idx = index(base, "comp");
+    bool starts = starts_with(trimmed, "moksha");
+    bool ends = ends_with(trimmed, "lang");
+    int len = length(trimmed);
+    char c = at(trimmed, 2);
+
+    // 3. Character Utilities
+    bool is_d = is_digit(c);
+    bool is_a = is_alpha(c);
+    bool is_w = is_whitespace(c);
+}
+
+void test_all_missing_array_builtins() {
+    // 1. Mutations and Allocations
+    int[] arr1 = [1, 2, 3, 4, 5];
+    int[] arr2 = [6, 7, 8];
+
+    extend(arr1, arr2);
+    reverse(arr1);
+    sort(arr1);
+
+    int[] dest = [0, 0, 0, 0, 0, 0, 0, 0];
+    copy(dest, arr1);
+    fill(dest, 99);
+
+    // 2. Queries and Accessors (Ensures arguments don't leak)
+    int cap = capacity(arr1);
+    int len = length(arr1);
+    int val = at(arr1, 2);
+    bool empty = is_empty(arr1);
+    bool has_val = contains(arr1, 3);
+    int idx = index(arr1, 4);
+}
+
+void test_all_missing_map_builtins() {
+    table<string, string[]> map = {
+        "k1": ["v1", "v2"],
+        "k2": ["v3"]
+    };
+
+    bool exist = has(map, "k1");
+    int len = length(map);
+    clear(map);
+}
+
+while (true) {
+    test_all_missing_string_builtins();
+    test_all_missing_array_builtins();
+    test_all_missing_map_builtins();
+}

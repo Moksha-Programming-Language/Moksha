@@ -251,6 +251,9 @@ bool DeadCodeEliminationPass::runOnModule(MIRModule &M) {
         markAlive(ins->getValue());
       } else if (auto *arc = llvm::dyn_cast_or_null<ARCInst>(i)) {
         markAlive(arc->getObject());
+        if (arc->getDropFunc()) {
+          markAlive(arc->getDropFunc());
+        }
       } else if (auto *ms = llvm::dyn_cast_or_null<MakeSharedInst>(i)) {
         markAlive(ms->getOperand());
       } else if (auto *mc = llvm::dyn_cast_or_null<MakeClosureInst>(i)) {

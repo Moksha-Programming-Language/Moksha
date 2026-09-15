@@ -1,0 +1,20 @@
+println("--- [E2E] exception_unwind_leaks.mox ---");
+
+void fail_with_resources() {
+    string local_str = "allocated_before_throw";
+    string[] local_arr = ["unwind_1", "unwind_2", "unwind_3"];
+    throw "critical_failure";
+}
+
+void test_unwind_leak() {
+    try {
+        string outer_str = "outer_guard";
+        fail_with_resources();
+    } catch (string err) {
+        // Exception caught and consumed
+    }
+}
+
+while (true) {
+    test_unwind_leak();
+}

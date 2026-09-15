@@ -1,0 +1,41 @@
+// For future implementation
+
+void test_fixed_char_buffers() {
+    char[6] s1 = "Hello";
+    char[16] s2 = "World";
+    char[6] s3 = ['H', 'e', 'l', 'l', 'o', '\0'];
+
+    char[2][16] arr2d = ["Moksha", "Systems"];
+
+    string decayed1 = s1;
+    string decayed2 = s2;
+    string joined = decayed1 + " " + decayed2;
+
+    s2 = "Reassigned";
+    string decayed3 = s2;
+}
+
+void test_dynamic_char_slices() {
+    char[] dynamic_chars = ['a', 'b', 'c', 'd'];
+
+    push(dynamic_chars, 'e');
+    push(dynamic_chars, 'f');
+
+    char[] sub = slice(dynamic_chars, 1, 4);
+    string s = cast<string>(dynamic_chars);
+}
+
+void test_mixed_char_containers() {
+    char[8] buf1 = "node_a";
+    char[8] buf2 = "node_b";
+
+    string[] list = [buf1, buf2, "node_c"];
+    push(list, buf1);
+}
+
+println("--- [E2E] c_strings_and_char_arrays_leak.mox ---");
+while (true) {
+    test_fixed_char_buffers();
+    test_dynamic_char_slices();
+    test_mixed_char_containers();
+}

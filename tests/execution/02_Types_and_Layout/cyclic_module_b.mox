@@ -1,6 +1,6 @@
 from "cyclic_module_a" import { ClassA }
 
-public class ClassB {
+public ref class ClassB {
     public ClassA? aRef;
 
     constructor() {

@@ -1,0 +1,27 @@
+println("--- [E2E] closure_env_churn_leaks.mox ---");
+
+void test_iife_closure_leak() {
+    string captured = "ephemeral_payload";
+    string res = (() => captured)();
+}
+
+void test_closure_rebind_leak() {
+    string token = "initial_token";
+    closure() -> string getter = () => token;
+    token = "updated_token";
+    getter = () => token;
+}
+
+void test_curried_closure_leak() {
+    closure() -> closure() -> string factory = () => {
+        string internal_str = "scoped_state";
+        return move () => internal_str;
+    };
+    closure() -> string inner = factory();
+}
+
+while (true) {
+    test_iife_closure_leak();
+    test_closure_rebind_leak();
+    test_curried_closure_leak();
+}

@@ -1,0 +1,23 @@
+println("--- [E2E] unsafe_and_borrowed_leaks.mox ---");
+
+union BadUnion {
+    int i;
+    string s;
+}
+
+void test_borrowed_refs() {
+    string owner = "owned_string";
+    *view string borrower = &owner;
+}
+
+void test_unsafe_union() {
+    unsafe {
+        BadUnion u;
+        u.i = 0;
+    }
+}
+
+while (true) {
+    test_borrowed_refs();
+    test_unsafe_union();
+}

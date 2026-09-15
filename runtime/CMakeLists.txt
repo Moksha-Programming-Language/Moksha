@@ -179,11 +179,10 @@ target_include_directories(moksha_rt PUBLIC
 # 7. Compiler-Specific Settings
 # ==============================================================================
 if(MSVC)
-  # /EHa enables asynchronous/SEH exception unwinding in MSVC
-  target_compile_options(moksha_rt PRIVATE /W4 /Z7 /EHa)
+  target_compile_options(moksha_rt PRIVATE /W4 /Z7 /EHa /O2 /GL)
 else()
-  # -fexceptions forces GCC/Clang to emit unwind tables for C code
-  target_compile_options(moksha_rt PRIVATE -Wall -Wextra -g -fexceptions)
+  # -fexceptions emits unwind tables.
+  target_compile_options(moksha_rt PRIVATE -Wall -Wextra -g -fexceptions -O3 -flto)
 endif()
 
 # ==============================================================================

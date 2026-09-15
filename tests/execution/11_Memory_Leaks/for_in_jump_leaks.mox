@@ -1,0 +1,37 @@
+println("--- [E2E] for_in_jump_leaks.mox ---");
+
+void test_for_in_break() {
+    string[] list = ["record_1", "record_2", "record_3", "record_4"];
+    for (item in list) {
+        if (item == "record_2") {
+            break;
+        }
+    }
+}
+
+void test_for_in_return() {
+    string[] list = ["event_a", "event_b", "event_c"];
+    for (item in list) {
+        if (item == "event_a") {
+            return;
+        }
+    }
+}
+
+void test_for_in_table_break() {
+    table<string, string> routes = {
+        "api/v1": "active",
+        "api/v2": "deprecated",
+        "api/v3": "preview"
+    };
+
+    for (k, v in routes) {
+        break;
+    }
+}
+
+while (true) {
+    test_for_in_break();
+    test_for_in_return();
+    test_for_in_table_break();
+}

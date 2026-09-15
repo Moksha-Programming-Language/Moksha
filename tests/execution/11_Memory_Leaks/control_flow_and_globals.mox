@@ -1,0 +1,38 @@
+println("--- [E2E] control_flow_and_globals.mox ---");
+
+string g_state = "init";
+string[] g_cache = [];
+
+void test_global_mutations() {
+    g_state = "mutated_global";
+    g_cache = ["cached_1", "cached_2"];
+}
+
+void test_early_returns_and_jumps() {
+    int i = 0;
+    while (i < 10) {
+        string iter_str = `iter_${i}`;
+        string[] iter_arr = [iter_str];
+        i++;
+        if (i == 5) continue;
+        if (i == 8) break;
+    }
+
+    string early_str = "early";
+    if (true) return;
+}
+
+void test_exception_paths() {
+    try {
+        string danger_str = "danger";
+        table<string, string> danger_map = {"k": "v"};
+        throw "abort";
+    } catch (any e) {
+    }
+}
+
+while (true) {
+    test_global_mutations();
+    test_early_returns_and_jumps();
+    test_exception_paths();
+}

@@ -2,8 +2,8 @@ println("--- [E2E] cyclic_module_a.mox (Cyclic Imports) ---")
 
 from "cyclic_module_b" import { ClassB }
 
-public class ClassA {
-    public ClassB? bRef;
+public ref class ClassA {
+    public weak ClassB? bRef;
 
     constructor() {
         this.bRef = null;

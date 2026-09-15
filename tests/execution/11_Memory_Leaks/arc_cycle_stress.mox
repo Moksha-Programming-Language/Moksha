@@ -1,0 +1,54 @@
+println("--- [E2E] arc_cycle_stress.mox ---");
+
+ref class Node {
+    public string id;
+    public Node? strong_next;
+    public weak Node? weak_prev;
+
+    constructor(string id) {
+        this.id = id;
+        this.strong_next = null;
+        this.weak_prev = null;
+    }
+}
+
+void test_doubly_linked_cycle() {
+    Node a = new Node("A");
+    Node b = new Node("B");
+    Node c = new Node("C");
+
+    // Forward Strong Links, Uncomment to see memory leaks
+    /* a.strong_next = b;
+    b.strong_next = c;
+    c.strong_next = a; */ // Creates a strong cycle (A -> B -> C -> A)
+
+    // Backward Weak Links
+    b.weak_prev = a;
+    c.weak_prev = b;
+    a.weak_prev = c;
+}
+
+void test_weak_resolution_leak() {
+    Node parent = new Node("Parent");
+    Node child = new Node("Child");
+
+    parent.strong_next = child;
+    child.weak_prev = parent;
+
+    // Upgrading weak to strong temporarily
+    Node? resolved = cast<Node?>(child.weak_prev);
+    if (resolved != null) {
+        resolved?.id = "Parent_Resolved";
+    }
+}
+
+void test_self_referential_weak() {
+    Node self_node = new Node("Self");
+    self_node.weak_prev = self_node;
+}
+
+while (true) {
+    test_doubly_linked_cycle();
+    test_weak_resolution_leak();
+    test_self_referential_weak();
+}

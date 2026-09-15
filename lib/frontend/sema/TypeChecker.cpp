@@ -143,6 +143,7 @@ static const Type *resolveAlias(const Type *t, ASTContext &context,
   return t;
 }
 
+static bool hasView(const Type *t);
 static bool hasMutOrLock(const Type *t) {
   if (!t)
     return false;
@@ -160,7 +161,7 @@ static bool hasMutOrLock(const Type *t) {
   if (auto ptr = llvm::dyn_cast_or_null<const PointerType>(t))
     return hasMutOrLock(ptr->getPointee());
   if (auto ref = llvm::dyn_cast_or_null<const ReferenceType>(t))
-    return hasMutOrLock(ref->getInner());
+    return !hasView(ref->getInner());
   if (auto arr = llvm::dyn_cast_or_null<const ArrayType>(t))
     return hasMutOrLock(arr->getElementType());
   if (auto slice = llvm::dyn_cast_or_null<const SliceType>(t))
@@ -185,7 +186,7 @@ static bool hasView(const Type *t) {
     return !hasMutOrLock(ptr->getPointee());
   }
   if (auto ref = llvm::dyn_cast_or_null<const ReferenceType>(t)) {
-    return !hasMutOrLock(ref->getInner());
+    return hasView(ref->getInner());
   }
 
   if (auto l = llvm::dyn_cast_or_null<const LockType>(t))
@@ -792,6 +793,45 @@ bool TypeChecker::isCastAllowed(const Type *src, const Type *dst) {
     return true;
   }
 
+  /* @brief Unwraps all concurrency types and weak types from the given type */
+  auto unwrapAll = [](const Type *t, bool &foundWeak) -> const Type * {
+    while (t) {
+      if (t->is<WeakType>())
+        foundWeak = true;
+
+      if (auto *nt = llvm::dyn_cast_or_null<const NullableType>(t))
+        t = nt->getInner();
+      else if (auto *pt = llvm::dyn_cast_or_null<const PointerType>(t))
+        t = pt->getPointee();
+      else if (auto *rt = llvm::dyn_cast_or_null<const ReferenceType>(t))
+        t = rt->getInner();
+      else if (auto *wt = llvm::dyn_cast_or_null<const WeakType>(t))
+        t = wt->getInner();
+      else if (auto *mt = llvm::dyn_cast_or_null<const MutType>(t))
+        t = mt->getInner();
+      else if (auto *lt = llvm::dyn_cast_or_null<const LockType>(t))
+        t = lt->getInner();
+      else if (auto *vt = llvm::dyn_cast_or_null<const ViewType>(t))
+        t = vt->getInner();
+      else if (auto *ct = llvm::dyn_cast_or_null<const ConstType>(t))
+        t = ct->getInner();
+      else if (auto *vol = llvm::dyn_cast_or_null<const VolatileType>(t))
+        t = vol->getInner();
+      else
+        break;
+    }
+    return t;
+  };
+
+  bool srcHasWeak = false, dstHasWeak = false;
+  const Type *coreSrc = unwrapAll(src, srcHasWeak);
+  const Type *coreDst = unwrapAll(dst, dstHasWeak);
+
+  if ((srcHasWeak || dstHasWeak) && coreSrc && coreDst &&
+      coreSrc->toString() == coreDst->toString()) {
+    return true;
+  }
+
   if (src->is<AnyType>() || dst->is<AnyType>()) {
     return true;
   }
@@ -800,6 +840,11 @@ bool TypeChecker::isCastAllowed(const Type *src, const Type *dst) {
     return true;
 
   if (dst->isString()) {
+    if (auto arr = llvm::dyn_cast_or_null<const ArrayType>(src)) {
+      if (!isCharType(arr->getElementType())) {
+        return false;
+      }
+    }
     return true;
   }
 
@@ -2538,33 +2583,53 @@ void TypeChecker::visitCallExpr(const CallExpr *expr) {
     memExpr->getObject()->accept(*this);
     currentExpectedReturnType = tempExpected;
     const Type *objType = lastComputedType;
-    const Type *rawObjType = unwrapConcurrency(objType);
+    const Type *rawObjType = objType;
+
     bool isOptionalCall = false;
-    if (auto *nullTy = llvm::dyn_cast_or_null<const NullableType>(rawObjType)) {
-      if (memExpr->isOptionalAccess()) {
-        rawObjType = unwrapConcurrency(nullTy->getInner());
-        isOptionalCall = true;
+    while (rawObjType) {
+      rawObjType = unwrapConcurrency(rawObjType);
+
+      if (auto *ptrTy = llvm::dyn_cast_or_null<const PointerType>(rawObjType)) {
+        rawObjType = ptrTy->getPointee();
+      } else if (auto *refTy =
+                     llvm::dyn_cast_or_null<const ReferenceType>(rawObjType)) {
+        rawObjType = refTy->getInner();
+      } else if (auto *nullTy =
+                     llvm::dyn_cast_or_null<const NullableType>(rawObjType)) {
+        if (memExpr->isOptionalAccess()) {
+          rawObjType = nullTy->getInner();
+          isOptionalCall = true;
+        } else {
+          Diags.report(memExpr->getLoc(), DiagID::err_type_mismatch)
+              << "Cannot call method on nullable type '" << objType->toString()
+              << "'. Use '?.' instead.";
+          hasError = true;
+          lastComputedType = context.getAnyType();
+          return;
+        }
       } else {
-        Diags.report(memExpr->getLoc(), DiagID::err_type_mismatch)
-            << "Cannot call method on nullable type '" << objType->toString()
-            << "'. Use '?.' instead.";
-        hasError = true;
-        lastComputedType = context.getAnyType();
-        return;
+        break;
       }
     }
-
-    if (auto *ptrTy = llvm::dyn_cast_or_null<const PointerType>(rawObjType)) {
-      rawObjType = ptrTy->getPointee();
-    } else if (auto *refTy =
-                   llvm::dyn_cast_or_null<const ReferenceType>(rawObjType)) {
-      rawObjType = refTy->getInner();
-    }
-
     rawObjType = unwrapConcurrency(rawObjType);
 
     if (auto namedType = llvm::dyn_cast_or_null<const NamedType>(rawObjType)) {
-      const ClassDecl *cls = context.lookupClass(namedType->getName());
+      std::string lookupName = namedType->getName();
+      Symbol *aliasSym = symbols.lookup(lookupName);
+      if (aliasSym && aliasSym->kind == SymbolKind::Class && aliasSym->decl) {
+        if (auto *cd =
+                llvm::dyn_cast_or_null<const ClassDecl>(aliasSym->decl)) {
+          lookupName = cd->getName();
+        } else if (auto *gd = llvm::dyn_cast_or_null<const GenericDecl>(
+                       aliasSym->decl)) {
+          if (auto *innerCd =
+                  llvm::dyn_cast_or_null<const ClassDecl>(gd->getInnerDecl())) {
+            lookupName = innerCd->getName();
+          }
+        }
+      }
+
+      const ClassDecl *cls = context.lookupClass(lookupName);
       if (cls) {
         llvm::StringMap<const Type *> substitutions;
         if (!namedType->getGenericArgs().empty()) {
@@ -3735,8 +3800,17 @@ void TypeChecker::visitMemberExpr(const MemberExpr *expr) {
     Symbol *sym = symbols.lookup(idObj->getName());
 
     if (sym && sym->kind == SymbolKind::Class) {
-      const ClassDecl *targetParent = static_cast<const ClassDecl *>(sym->decl);
-      if (!isSubclassOf(currentClassDecl, targetParent->getName())) {
+      const ClassDecl *targetParent = nullptr;
+      if (auto *cd = llvm::dyn_cast_or_null<const ClassDecl>(sym->decl)) {
+        targetParent = cd;
+      } else if (auto *gd =
+                     llvm::dyn_cast_or_null<const GenericDecl>(sym->decl)) {
+        targetParent =
+            llvm::dyn_cast_or_null<const ClassDecl>(gd->getInnerDecl());
+      }
+
+      if (targetParent &&
+          !isSubclassOf(currentClassDecl, targetParent->getName())) {
         Diags.report(expr->getLoc(), DiagID::err_type_mismatch)
             << "'" << targetParent->getName() << "' is not a parent of '"
             << currentClassDecl->getName() << "'";
@@ -4394,7 +4468,13 @@ void TypeChecker::visitVariableDecl(const VariableDecl *decl) {
     if (!classDecl) {
       if (const Symbol *sym = symbols.lookup(namedTy->getName())) {
         if (sym->kind == SymbolKind::Class && sym->decl) {
-          classDecl = llvm::dyn_cast_or_null<const ClassDecl>(sym->decl);
+          if (auto *cd = llvm::dyn_cast_or_null<const ClassDecl>(sym->decl)) {
+            classDecl = cd;
+          } else if (auto *gd =
+                         llvm::dyn_cast_or_null<const GenericDecl>(sym->decl)) {
+            classDecl =
+                llvm::dyn_cast_or_null<const ClassDecl>(gd->getInnerDecl());
+          }
         }
       }
     }
@@ -4650,9 +4730,7 @@ void TypeChecker::visitVariableDecl(const VariableDecl *decl) {
     }
   }
 
-  // DO NOT RE-MANGLE: The AST name was permanently rewritten in Pass 1A!
   std::string symName = decl->getName();
-
   if (!symbols.isDefinedInCurrentScope(symName)) {
     Symbol sym(SymbolKind::Variable, symName, effectiveType, decl);
     sym.bitWidth = decl->getBitWidth();
@@ -4667,9 +4745,16 @@ void TypeChecker::visitVariableDecl(const VariableDecl *decl) {
       if (existing->decl == decl) {
         existing->type = effectiveType;
       } else {
-        Diags.report(decl->getLoc(), DiagID::err_symbol_redefinition)
-            << decl->getName();
-        hasError = true;
+        if (existing->type && effectiveType &&
+            existing->type->isEquivalent(*effectiveType)) {
+          if (decl->getInitializer()) {
+            initializedVars.insert(existing->decl);
+          }
+        } else {
+          Diags.report(decl->getLoc(), DiagID::err_symbol_redefinition)
+              << decl->getName();
+          hasError = true;
+        }
       }
     }
   }
@@ -4710,8 +4795,6 @@ void TypeChecker::visitFunctionDecl(const FunctionDecl *decl) {
 
   const Type *fnType =
       context.createFunctionType(pTypes, retType, decl->isVariadicFunc());
-
-  // Use the name which has already been rewritten in Pass 1A
   std::string symName = decl->getName();
 
   if (!symbols.isDefinedInCurrentScope(symName)) {
@@ -4726,9 +4809,26 @@ void TypeChecker::visitFunctionDecl(const FunctionDecl *decl) {
       if (existing->decl == decl) {
         existing->type = fnType;
       } else {
-        Diags.report(decl->getLoc(), DiagID::err_symbol_redefinition)
-            << decl->getName();
-        hasError = true;
+        if (existing->type && fnType && existing->type->isEquivalent(*fnType)) {
+          // Silently accept identical function redeclarations
+        } else if (existing->kind == SymbolKind::Function) {
+          bool found = false;
+          for (auto &o : existing->overloads) {
+            if (o.decl == decl) {
+              o.type = fnType;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            existing->overloads.push_back(
+                Symbol(SymbolKind::Function, symName, fnType, decl));
+          }
+        } else {
+          Diags.report(decl->getLoc(), DiagID::err_symbol_redefinition)
+              << decl->getName();
+          hasError = true;
+        }
       }
     }
   }
@@ -5039,13 +5139,21 @@ void TypeChecker::visitForInStmt(const ForInStmt *stmt) {
   }
 
   if (stmt->getVariable()) {
+    const Type *finalValType = valType;
+    if (auto *vd = llvm::dyn_cast_or_null<VariableDecl>(stmt->getVariable())) {
+      if (vd->getType() && vd->getType()->is<ReferenceType>()) {
+        finalValType = context.saveType(
+            std::make_unique<ReferenceType>(valType->clone(), vd->getLoc()));
+      }
+    }
+
     initializedVars.insert(stmt->getVariable());
-    Symbol valSym(SymbolKind::Variable, stmt->getVariable()->getName(), valType,
-                  stmt->getVariable());
+    Symbol valSym(SymbolKind::Variable, stmt->getVariable()->getName(),
+                  finalValType, stmt->getVariable());
     symbols.addSymbol(stmt->getVariable()->getName(), valSym, stmt->getLoc());
 
     if (auto *vd = llvm::dyn_cast_or_null<VariableDecl>(stmt->getVariable())) {
-      const_cast<VariableDecl *>(vd)->setType(valType->clone());
+      const_cast<VariableDecl *>(vd)->setType(finalValType->clone());
     }
   }
 
@@ -5453,9 +5561,16 @@ void TypeChecker::visitModuleDecl(const ModuleDecl *decl) {
       if (!symbols.addSymbol(symName,
                              Symbol(SymbolKind::Function, symName, fnType, fd),
                              fd->getLoc())) {
-        Diags.report(fd->getLoc(), DiagID::err_symbol_redefinition)
-            << fd->getName();
-        hasError = true;
+        if (Symbol *existing = symbols.lookup(symName)) {
+          if (existing->kind == SymbolKind::Function) {
+            existing->overloads.push_back(
+                Symbol(SymbolKind::Function, symName, fnType, fd));
+          } else {
+            Diags.report(fd->getLoc(), DiagID::err_symbol_redefinition)
+                << fd->getName();
+            hasError = true;
+          }
+        }
       }
     } else if (auto cd = llvm::dyn_cast_or_null<const ClassDecl>(currentDecl)) {
       symbols.addSymbol(cd->getName(),
@@ -5809,9 +5924,15 @@ void TypeChecker::visitClassDecl(const ClassDecl *decl) {
       Symbol sym(SymbolKind::Function, fd->getName(), fnType, fd);
 
       if (!symbols.addSymbol(fd->getName(), sym, fd->getLoc())) {
-        Diags.report(fd->getLoc(), DiagID::err_symbol_redefinition)
-            << fd->getName();
-        hasError = true;
+        if (Symbol *existing = symbols.lookup(fd->getName())) {
+          if (existing->kind == SymbolKind::Function) {
+            existing->overloads.push_back(sym);
+          } else {
+            Diags.report(fd->getLoc(), DiagID::err_symbol_redefinition)
+                << fd->getName();
+            hasError = true;
+          }
+        }
       }
     }
   }
@@ -5979,44 +6100,54 @@ void TypeChecker::visitImportDecl(const ImportDecl *decl) {
   std::string modStr = modName.str();
   size_t slash = modName.find_last_of('/');
 
-  // 1. Determine the active namespace (Alias overrides the default module name)
+  // Determine the active namespace
   std::string ns = decl->getAliasName();
   if (ns.empty()) {
     ns = (slash != llvm::StringRef::npos) ? modName.substr(slash + 1).str()
                                           : modStr;
   }
 
-  // 2. Load the module using the callback
-  if (loadModuleCallback) {
-    if (ModuleDecl *importedMod = loadModuleCallback(modStr)) {
-      static std::set<ModuleDecl *> processedModules;
-      if (processedModules.find(importedMod) == processedModules.end()) {
-        processedModules.insert(importedMod);
-        importedMod->accept(*this);
+  bool alreadyLoaded = false;
+  if (!decl->getSymbols().empty()) {
+    alreadyLoaded = true;
+    for (const auto &symPair : decl->getSymbols()) {
+      if (!symbols.lookup(symPair.first)) {
+        alreadyLoaded = false;
+        break;
       }
-    } else {
-      Diags.report(decl->getLoc(), DiagID::err_internal)
-          << "Failed to resolve and load module: '" << modStr << "'";
-      hasError = true;
-      return;
     }
   }
 
-  // 3. Register the namespace / symbols
+  // Load the module using the callback
+  if (loadModuleCallback) {
+    // Track imports by string path to prevent loading identical files
+    static std::set<std::string> processedModules;
+    if (processedModules.find(modStr) == processedModules.end() &&
+        !alreadyLoaded) {
+      processedModules.insert(modStr);
+      if (ModuleDecl *importedMod = loadModuleCallback(modStr)) {
+        importedMod->accept(*this);
+      } else {
+        Diags.report(decl->getLoc(), DiagID::err_internal)
+            << "Failed to resolve and load module: '" << modStr << "'";
+        hasError = true;
+        return;
+      }
+    }
+  }
+
+  // Register the namespace / symbols
   if (decl->getSymbols().empty()) {
-    // Full module import (e.g., `import test` OR `import test as t`)
     if (!symbols.lookup(ns)) {
       symbols.addSymbol(ns,
                         Symbol(SymbolKind::Module, ns, context.getAnyType()),
                         decl->getLoc());
     }
   } else {
-    // Destructured import (e.g., `import { a, b as c } from test`)
     for (const auto &symPair : decl->getSymbols()) {
       const std::string &originalName = symPair.first;
       const std::string &aliasName = symPair.second;
 
-      // 1. Look up the REAL symbol in the imported namespace
       std::string fqName = ns + "." + originalName;
       Symbol *realSym = symbols.lookup(fqName);
 
@@ -6031,24 +6162,29 @@ void TypeChecker::visitImportDecl(const ImportDecl *decl) {
             decl->getLoc());
       }
 
-      // 2. Track ambiguity using the ALIAS NAME
       if (std::find(ambiguousImports[aliasName].begin(),
                     ambiguousImports[aliasName].end(),
                     ns) == ambiguousImports[aliasName].end()) {
         ambiguousImports[aliasName].push_back(ns);
       }
 
-      // 3. Bind it into the local scope under the ALIAS NAME
       if (ambiguousImports[aliasName].size() == 1) {
         if (!symbols.lookup(aliasName)) {
           if (realSym) {
             Symbol aliasedSym = *realSym;
-            aliasedSym.name = aliasName; // Rename the symbol in memory
+            aliasedSym.name = aliasName;
             symbols.addSymbol(aliasName, aliasedSym, decl->getLoc());
 
             if (aliasedSym.kind == SymbolKind::Class && aliasedSym.decl) {
-              context.registerClass(
-                  static_cast<const ClassDecl *>(aliasedSym.decl));
+              if (auto *cd = llvm::dyn_cast<const ClassDecl>(aliasedSym.decl)) {
+                context.registerClass(cd);
+              } else if (auto *gd = llvm::dyn_cast<const GenericDecl>(
+                             aliasedSym.decl)) {
+                if (auto *innerCd =
+                        llvm::dyn_cast<const ClassDecl>(gd->getInnerDecl())) {
+                  context.registerClass(innerCd);
+                }
+              }
             }
           } else {
             symbols.addSymbol(aliasName,
@@ -6135,11 +6271,17 @@ void TypeChecker::visitNamedType(const NamedType *type) {
     }
   }
 
-  // If string maps to a local alias for a class, extract its true internal
-  // name
   Symbol *aliasSym = symbols.lookup(lookupName);
   if (aliasSym && aliasSym->kind == SymbolKind::Class && aliasSym->decl) {
-    lookupName = static_cast<const ClassDecl *>(aliasSym->decl)->getName();
+    if (auto *cd = llvm::dyn_cast_or_null<const ClassDecl>(aliasSym->decl)) {
+      lookupName = cd->getName();
+    } else if (auto *gd =
+                   llvm::dyn_cast_or_null<const GenericDecl>(aliasSym->decl)) {
+      if (auto *innerCd =
+              llvm::dyn_cast_or_null<const ClassDecl>(gd->getInnerDecl())) {
+        lookupName = innerCd->getName();
+      }
+    }
   }
 
   if (!type->getGenericArgs().empty()) {
@@ -6189,6 +6331,7 @@ void TypeChecker::visitNamedType(const NamedType *type) {
         auto &mutableArgs = const_cast<std::vector<NamedType::GenericArg> &>(
             mutType->getGenericArgs());
         mutableArgs.clear();
+        lookupName = concreteClass->getName();
       }
     }
   }

@@ -1,0 +1,72 @@
+// For future implementation
+
+ref class Payload {
+    public string tag;
+    public table<string, int[]?> data;
+
+    constructor(string tag) {
+        this.tag = tag;
+        this.data = {};
+    }
+}
+
+class ValueNode {
+    public int id;
+    public string? description;
+
+    constructor(int id, string? desc) {
+        this.id = id;
+        this.description = desc;
+    }
+}
+
+void test_nullable_primitives_and_strings() {
+    int? opt_int = 42;
+    double? opt_flt = 3.14159;
+    bool? opt_bool = true;
+
+    opt_int = null;
+    opt_flt = null;
+    opt_bool = null;
+
+    string? s = "temporary_payload";
+    s = null;
+    s = "reassigned_payload";
+    s = null;
+}
+
+void test_nullable_collections() {
+    int[]?[]? matrix = [
+        [1, 2, 3],
+        null,
+        [4, 5]
+    ];
+    matrix = null;
+
+    table<string, string[]?> map = {};
+    map["primary"] = ["alpha", "beta"];
+    map["secondary"] = null;
+    map["tertiary"] = ["gamma"];
+
+    map["primary"] = null;
+}
+
+void test_nullable_classes() {
+    ValueNode stackNode = new ValueNode(101, "stack_node_desc");
+    stackNode.description = null;
+
+    shared Payload? refNode = cast<Payload?>(new Payload("root_payload"));
+    if (refNode != null) {
+        refNode?.data?["metrics"] = [10, 20, 30];
+        refNode?.data?["empty_metrics"] = null;
+    }
+
+    refNode = null;
+}
+
+println("--- [E2E] nullability_matrix_and_containers_leak.mox ---");
+while (true) {
+    test_nullable_primitives_and_strings();
+    test_nullable_collections();
+    test_nullable_classes();
+}

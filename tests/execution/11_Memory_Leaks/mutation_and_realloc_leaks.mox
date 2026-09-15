@@ -1,0 +1,23 @@
+println("--- [E2E] mutation_and_realloc_leaks.mox ---");
+
+void test_array_reallocs() {
+    string[] dynamic_list = [];
+    for (int i = 0; i < 50; i++) {
+        push(dynamic_list, `item_${i}`);
+    }
+    resize(dynamic_list, 10);
+    remove(dynamic_list, 5);
+    insert(dynamic_list, 2, "inserted_item");
+}
+
+void test_map_replacements() {
+    table<string, string[]> dict = {};
+    dict["group"] = ["a", "b"];
+    dict["group"] = ["c", "d"];
+    remove(dict, "group");
+}
+
+while (true) {
+    test_array_reallocs();
+    test_map_replacements();
+}

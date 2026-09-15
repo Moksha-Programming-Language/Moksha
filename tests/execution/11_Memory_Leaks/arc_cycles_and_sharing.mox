@@ -1,0 +1,36 @@
+ref class ListNode {
+    public string val;
+    public ListNode? next;
+    public weak ListNode? prev;
+    constructor(string v) {
+        this.val = v;
+        this.next = null;
+        this.prev = null;
+    }
+}
+
+void test_shared_aliasing() {
+    string[] base_arr = ["shared_1", "shared_2"];
+    string[] alias_arr = base_arr;
+    alias_arr[0] = "mutated_shared";
+}
+
+void test_linked_list_cycle() {
+    ListNode a = new ListNode("A");
+    ListNode b = new ListNode("B");
+    a.next = b;
+    b.prev = a;
+}
+
+void test_reassignments() {
+    string temp = "first_alloc";
+    temp = "second_alloc";
+    string[] arr = ["arr_1"];
+    arr = ["arr_2"];
+}
+
+while (true) {
+    test_shared_aliasing();
+    test_linked_list_cycle();
+    test_reassignments();
+}

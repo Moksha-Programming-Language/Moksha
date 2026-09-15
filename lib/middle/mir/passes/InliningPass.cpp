@@ -182,6 +182,10 @@ bool InliningPass::inlineCall(
       auto clonedInst = oldInstPtr->clone();
       clonedInst->setBorrowKind(oldInstPtr->getBorrowKind());
 
+      if (!clonedInst->getName().empty()) {
+        clonedInst->setName(caller->getUniqueName(clonedInst->getName()));
+      }
+
       MIRInst *rawInst = clonedInst.get();
       valueMap[oldInstPtr.get()] = rawInst;
       allClonedInsts.push_back(rawInst);
@@ -446,6 +450,10 @@ bool InliningPass::inlineInvoke(
     for (const auto &oldInstPtr : oldBlockPtr->getInstructions()) {
       auto clonedInst = oldInstPtr->clone();
       clonedInst->setBorrowKind(oldInstPtr->getBorrowKind());
+
+      if (!clonedInst->getName().empty()) {
+        clonedInst->setName(caller->getUniqueName(clonedInst->getName()));
+      }
 
       MIRInst *rawInst = clonedInst.get();
       valueMap[oldInstPtr.get()] = rawInst;

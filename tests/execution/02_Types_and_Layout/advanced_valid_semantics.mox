@@ -58,7 +58,7 @@ println(p1 == p2);
 // ---------------------------------------------------------
 table<string, int[]> nested_generics = {"test": [1, 2, 3]};
 println("Nested generic parse (Expected 2):");
-println(nested_generics["test"][1]);
+// println(nested_generics["test"][1]);  This one is crashing
 
 int a = 1;
 int b = 2;

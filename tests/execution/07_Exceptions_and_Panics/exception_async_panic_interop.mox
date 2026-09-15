@@ -27,5 +27,5 @@ void test_panic_vs_throw() {
 }
 
 // Execution requires an async runner, but tests the syntax/semantics
-test_async_throw();
+await test_async_throw();
 test_panic_vs_throw();

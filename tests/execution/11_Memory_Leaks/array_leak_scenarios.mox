@@ -1,0 +1,81 @@
+println("--- [E2E] array_leak_scenarios.mox ---");
+println("Running continuous array memory stress test. Check Task Manager...");
+
+void test_primitive_dynamic_leaks() {
+    int[] int_dyn = [10, 20, 30, 40, 50];
+    push(int_dyn, 60);
+    push(int_dyn, 70);
+
+    int[] cloned_int = clone(int_dyn);
+    resize(cloned_int, 10);
+    clear(cloned_int);
+
+    float[] flt_dyn = [1.1, 2.2, 3.3];
+    flt_dyn = [4.4, 5.5, 6.6, 7.7];
+}
+
+void test_primitive_fixed_leaks() {
+    int[5] fixed_int = [1, 2, 3, 4, 5];
+    float[4] fixed_flt = [0.5, 1.5, 2.5, 3.5];
+
+    int[] int_view = slice(fixed_int, 1, 4);
+    float[] flt_view = slice(fixed_flt, 0, 2);
+
+    int[] spread_dyn = [...fixed_int, 6, 7];
+}
+
+void test_string_fixed_leaks() {
+    string[4] fixed_strs = ["header", "payload", "checksum", "footer"];
+
+    fixed_strs[0] = "new_header";
+    fixed_strs[1] = `dynamic_payload_${42}`;
+
+    string[] str_view = slice(fixed_strs, 1, 3);
+}
+
+void test_mixed_array_churn() {
+    string[3] fixed_strs = ["alpha", "beta", "gamma"];
+    string[] dyn_strs = ["delta", "epsilon"];
+
+    string[] merged = [...fixed_strs, ...dyn_strs, "zeta"];
+
+    dyn_strs = ["new_1", "new_2"];
+}
+
+void test_multidimensional_leaks() {
+    int[2][2] fixed_mat = [
+        [1, 2],
+        [3, 4]
+    ];
+
+    float[][] dyn_mat = [
+        [1.0, 2.0],
+        [3.0, 4.0, 5.0]
+    ];
+
+    string[2][2] fixed_str_mat = [
+        ["r0c0", "r0c1"],
+        ["r1c0", "r1c1"]
+    ];
+    fixed_str_mat[0][1] = "replaced_cell";
+}
+
+void test_array_any_boxing() {
+    int[3] fixed_int = [100, 200, 300];
+    any boxed_fixed = fixed_int;
+
+    float[] dyn_flt = [9.9, 8.8];
+    any boxed_dyn = dyn_flt;
+
+    string[2] fixed_str = ["box_a", "box_b"];
+    any boxed_str_fixed = fixed_str;
+}
+
+while (true) {
+    test_primitive_dynamic_leaks();
+    test_primitive_fixed_leaks();
+    test_string_fixed_leaks();
+    test_mixed_array_churn();
+    test_multidimensional_leaks();
+    test_array_any_boxing();
+}

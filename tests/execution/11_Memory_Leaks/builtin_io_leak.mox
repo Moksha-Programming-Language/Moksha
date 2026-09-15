@@ -1,0 +1,118 @@
+println("--- [E2E] builtin_io_leak.mox ---");
+println("WARNING: Running continuous Disk I/O. Terminate after 10 seconds to prevent SSD wear.");
+
+void test_basic_io() {
+    any f = open("leak_basic.txt", WRITE | CREATE);
+    write(f, "Moksha V1");
+    close(f);
+
+    any f_read = open("leak_basic.txt", READ);
+    int s = size(f_read);
+    any data = read(f_read);
+    close(f_read);
+
+    remove("leak_basic.txt");
+}
+
+void test_high_level_text() {
+    writeText("leak_hello.txt", "Hello\n");
+    appendText("leak_hello.txt", "World");
+    any content = readText("leak_hello.txt");
+    any lines = readLines("leak_hello.txt");
+
+    remove("leak_hello.txt");
+}
+
+void test_high_level_binary() {
+    int[] out_bytes = [255, 128, 64];
+    writeBytes("leak_data.bin", out_bytes);
+    int[] more_bytes = [32, 16];
+    appendBytes("leak_data.bin", more_bytes);
+    any in_bytes = readBytes("leak_data.bin");
+
+    remove("leak_data.bin");
+}
+
+void test_structured_data() {
+    any config_out = {"version": 1, "name": "moksha"};
+    writeJson("leak_config.json", config_out);
+    any config_in = readJson("leak_config.json");
+    remove("leak_config.json");
+
+    writeYaml("leak_config.yaml", config_out);
+    any yaml_in = readYaml("leak_config.yaml");
+    remove("leak_config.yaml");
+}
+
+void test_stream_navigation() {
+    any f_stream = open("leak_stream.txt", WRITE | CREATE | TRUNCATE);
+    writeLine(f_stream, "Line 1");
+    writeLine(f_stream, "Line 2");
+    flush(f_stream);
+    close(f_stream);
+
+    any f_in_stream = open("leak_stream.txt", READ);
+    any l1 = readLine(f_in_stream);
+    int pos = tell(f_in_stream);
+    seek(f_in_stream, 0);
+    readLine(f_in_stream);
+    readLine(f_in_stream);
+    bool end = eof(f_in_stream);
+    close(f_in_stream);
+
+    any f_trunc = open("leak_stream.txt", WRITE | APPEND);
+    truncate(f_trunc, 4);
+    close(f_trunc);
+
+    remove("leak_stream.txt");
+}
+
+void test_csv_operations() {
+    any row1 = {"id": 1, "name": "Moksha", "type": "Language"};
+    any row2 = {"id": 2, "name": "Compiler", "type": "Tool"};
+    any[] data_out = [row1, row2];
+
+    writeCsv("leak_test.csv", data_out);
+    any csv_in = readCsv("leak_test.csv");
+
+    remove("leak_test.csv");
+}
+
+void test_pdf_operations() {
+    any pdf = createPdf("leak_doc.pdf");
+    writePdfText(pdf, "Moksha PDF Generation");
+    savePdf(pdf);
+    any in_pdf = openPdf("leak_doc.pdf");
+    any text = extractText(in_pdf);
+
+    remove("leak_doc.pdf");
+}
+
+void test_filesystem_ops() {
+    createDir("leak_sandbox");
+    bool check_dir = isDir("leak_sandbox");
+
+    writeText("leak_sandbox/temp.txt", "data");
+    bool check_file = isFile("leak_sandbox/temp.txt");
+
+    copy("leak_sandbox/temp.txt", "leak_sandbox/backup.txt");
+    move_file("leak_sandbox/backup.txt", "leak_sandbox/moved.txt");
+
+    any files = listDir("leak_sandbox");
+    bool check_exists = exists("leak_sandbox/moved.txt");
+
+    remove("leak_sandbox/temp.txt");
+    remove("leak_sandbox/moved.txt");
+    removeDir("leak_sandbox");
+}
+
+while (true) {
+    test_basic_io();
+    test_high_level_text();
+    test_high_level_binary();
+    test_structured_data();
+    test_stream_navigation();
+    test_csv_operations();
+    test_pdf_operations();
+    test_filesystem_ops();
+}

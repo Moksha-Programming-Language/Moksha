@@ -1,0 +1,29 @@
+println("--- [E2E] nested_collection_dtor_leaks.mox ---");
+
+void test_jagged_string_arrays() {
+    string[][] matrix = [
+        ["row0_col0", "row0_col1"],
+        ["row1_col0", "row1_col1", "row1_col2"],
+        ["row2_col0"]
+    ];
+}
+
+void test_table_of_string_slices() {
+    table<string, string[]> dataset = {
+        "group_a": ["entry_1", "entry_2"],
+        "group_b": ["entry_3", "entry_4", "entry_5"]
+    };
+}
+
+void test_slice_of_tables() {
+    table<string, string>[] configs = [
+        {"env": "staging", "region": "us-east"},
+        {"env": "prod", "region": "eu-central"}
+    ];
+}
+
+while (true) {
+    test_jagged_string_arrays();
+    test_table_of_string_slices();
+    test_slice_of_tables();
+}

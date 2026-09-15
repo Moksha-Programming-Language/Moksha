@@ -1,0 +1,67 @@
+println("--- [E2E] advanced_boundaries_and_nesting.mox ---");
+
+// Stack-allocated value type (copies bytes, drops fields directly)
+class StackNode {
+    public string id;
+    public table<string, string[]> attributes;
+
+    constructor(string id) {
+        this.id = id;
+        this.attributes = {};
+    }
+}
+
+// Heap-allocated reference type (ARC managed, releases pointer)
+ref class RefNode {
+    public string id;
+    public table<string, string[]> attributes;
+
+    constructor(string id) {
+        this.id = id;
+        this.attributes = {};
+    }
+}
+
+void test_empty_and_singletons() {
+    string[] empty_arr = [];
+    table<string, string> empty_map = {};
+    string[] single_arr = ["lonely"];
+    table<string, string> single_map = {"key": "val"};
+}
+
+void test_deep_nesting() {
+    table<string, table<string, string[][]>> deep = {
+        "root": { "branch": [["leaf_a"], ["leaf_b"]] }
+    };
+}
+
+void test_optionals() {
+    string? opt_str = "optional_payload";
+    string[]? opt_arr = ["opt_1", "opt_2"];
+    opt_str = null;
+    opt_arr = null;
+}
+
+void test_stack_class_containers() {
+    StackNode node = new StackNode("stack_node_1");
+    node.attributes["tags"] = ["urgent", "critical"];
+
+    // Arrays of structs copy the bytes and take ownership of the inner allocations
+    StackNode[] nodes = [node, new StackNode("stack_node_2")];
+}
+
+void test_ref_class_containers() {
+    RefNode node = new RefNode("ref_node_1");
+    node.attributes["tags"] = ["urgent", "critical"];
+
+    // Arrays of ref classes hold ARC pointers and retain them
+    RefNode[] nodes = [node, new RefNode("ref_node_2")];
+}
+
+while (true) {
+    test_empty_and_singletons();
+    test_deep_nesting();
+    test_optionals();
+    test_stack_class_containers();
+    test_ref_class_containers();
+}

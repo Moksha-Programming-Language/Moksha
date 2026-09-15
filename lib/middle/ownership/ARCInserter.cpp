@@ -28,54 +28,66 @@ public:
     }
 
     // Global Teardown (Module Destroy)
-    if (MIRFunction *destroyFunc =
-            module->getFunction("__moksha_module_destroy")) {
-      if (!destroyFunc->getBlocks().empty()) {
-        MIRBlock *entry = destroyFunc->getEntryBlock();
-        auto retIt = entry->getInstructionsMut().end();
-        for (auto it = entry->getInstructionsMut().begin();
-             it != entry->getInstructionsMut().end(); ++it) {
-          if (llvm::isa<ReturnInst>(it->get())) {
-            retIt = it;
-            break;
-          }
+    MIRFunction *destroyFunc = module->getFunction("__moksha_module_destroy");
+
+    // Synthesize the teardown function if the frontend didn't generate one
+    if (!destroyFunc) {
+      auto fn = std::make_unique<MIRFunction>(
+          nullptr, "__moksha_module_destroy", Linkage::External);
+      destroyFunc = fn.get();
+      module->addFunction(std::move(fn));
+
+      auto block = std::make_unique<MIRBlock>("entry", destroyFunc);
+      block->getInstructionsMut().push_back(
+          std::make_unique<ReturnInst>(nullptr, SourceLocation()));
+      destroyFunc->addBlock(std::move(block));
+    }
+
+    if (!destroyFunc->getBlocks().empty()) {
+      MIRBlock *entry = destroyFunc->getEntryBlock();
+      auto retIt = entry->getInstructionsMut().end();
+      for (auto it = entry->getInstructionsMut().begin();
+           it != entry->getInstructionsMut().end(); ++it) {
+        if (llvm::isa<ReturnInst>(it->get())) {
+          retIt = it;
+          break;
+        }
+      }
+
+      for (auto &globalPtr : module->getGlobalsMut()) {
+        MIRGlobal *g = globalPtr.get();
+
+        if (g->isConstant()) {
+          continue;
         }
 
-        for (auto &globalPtr : module->getGlobalsMut()) {
-          MIRGlobal *g = globalPtr.get();
+        // Check if the global's underlying type requires ARC
+        const hir::HIRType *valTy = nullptr;
+        if (auto *ptrTy =
+                llvm::dyn_cast_or_null<hir::PointerType>(g->getType())) {
+          valTy = ptrTy->getPointee();
+        } else {
+          valTy = g->getType();
+        }
 
-          if (g->isConstant()) {
-            continue;
-          }
+        if (valTy && isRefCounted(valTy)) {
+          // 1. Load the global
+          auto loadInst = std::make_unique<LoadInst>(
+              g, g->getName() + ".cleanup", SourceLocation());
+          loadInst->setParent(entry);
+          MIRValue *loadedVal = loadInst.get();
 
-          // Check if the global's underlying type requires ARC
-          const hir::HIRType *valTy = nullptr;
-          if (auto *ptrTy =
-                  llvm::dyn_cast_or_null<hir::PointerType>(g->getType())) {
-            valTy = ptrTy->getPointee();
-          } else {
-            valTy = g->getType();
-          }
-
-          if (valTy && isRefCounted(valTy)) {
-            // 1. Load the global
-            auto loadInst = std::make_unique<LoadInst>(
-                g, g->getName() + ".cleanup", SourceLocation());
-            loadInst->setParent(entry);
-            MIRValue *loadedVal = loadInst.get();
-
-            // 2. Release it
-            auto releaseInst = std::make_unique<ARCInst>(
-                Opcode::Release, loadedVal, getDropFunc(loadedVal),
-                SourceLocation());
-            releaseInst->setParent(entry);
-            retIt =
-                entry->getInstructionsMut().insert(retIt, std::move(loadInst));
-            ++retIt;
-            retIt = entry->getInstructionsMut().insert(retIt,
-                                                       std::move(releaseInst));
-            modified = true;
-          }
+          // 2. Release it
+          auto releaseInst = std::make_unique<ARCInst>(
+              Opcode::Release, loadedVal, getDropFunc(loadedVal),
+              SourceLocation());
+          releaseInst->setParent(entry);
+          retIt =
+              entry->getInstructionsMut().insert(retIt, std::move(loadInst));
+          ++retIt;
+          retIt =
+              entry->getInstructionsMut().insert(retIt, std::move(releaseInst));
+          modified = true;
         }
       }
     }
@@ -99,12 +111,38 @@ private:
     }
     if (valTy) {
       std::string typeName = valTy->toString();
-      if (typeName.find("shared ") == 0)
-        typeName = typeName.substr(7);
-      if (typeName.find("struct ") == 0)
-        typeName = typeName.substr(7);
-      if (typeName.find("class ") == 0)
-        typeName = typeName.substr(6);
+
+      auto removePrefix = [&](const std::string &prefix) {
+        if (typeName.find(prefix) == 0)
+          typeName = typeName.substr(prefix.length());
+      };
+
+      while (!typeName.empty() && (typeName[0] == '&' || typeName[0] == '*' ||
+                                   typeName[0] == ' ' || typeName[0] == '?')) {
+        typeName = typeName.substr(1);
+      }
+
+      removePrefix("shared ");
+      removePrefix("owned ");
+      removePrefix("weak ");
+      removePrefix("mut ");
+      removePrefix("view ");
+      removePrefix("lock ");
+      removePrefix("struct ");
+      removePrefix("class ");
+
+      size_t arcPos = typeName.find("Arc<");
+      size_t boxPos = typeName.find("Box<");
+      size_t startPos =
+          (arcPos != std::string::npos)
+              ? arcPos
+              : ((boxPos != std::string::npos) ? boxPos : std::string::npos);
+      if (startPos != std::string::npos) {
+        typeName = typeName.substr(startPos + 4);
+        size_t endPos = typeName.rfind(">");
+        if (endPos != std::string::npos)
+          typeName = typeName.substr(0, endPos);
+      }
 
       std::string dropName = typeName + ".destructor_ret_void";
       return module->getFunction(dropName);
@@ -116,12 +154,11 @@ private:
     if (!type)
       return false;
 
-    // 1. Unwrap Nullable Optionals (e.g., Node?)
-    if (auto *nullableTy = llvm::dyn_cast_or_null<const hir::HIRNullableType>(type)) {
+    if (auto *nullableTy =
+            llvm::dyn_cast_or_null<const hir::HIRNullableType>(type)) {
       type = nullableTy->getInner();
     }
 
-    // 2. Safely capture Reference Classes and explicitly tagged pointers
     if (auto *ptrType = llvm::dyn_cast_or_null<const hir::PointerType>(type)) {
       if (ptrType->getOwnership() == hir::Ownership::Borrowed ||
           ptrType->getOwnership() == hir::Ownership::None) {
@@ -139,11 +176,11 @@ private:
       return false;
     }
 
-    // 3. Catch native built-in managed types
     auto kind = type->getKind();
     if (kind == hir::TypeKind::Any || kind == hir::TypeKind::Slice ||
         kind == hir::TypeKind::String || kind == hir::TypeKind::Map ||
-        kind == hir::TypeKind::Closure || kind == hir::TypeKind::Promise) {
+        kind == hir::TypeKind::Closure || kind == hir::TypeKind::Function ||
+        kind == hir::TypeKind::Promise) {
       return true;
     }
 
@@ -153,8 +190,9 @@ private:
   // Analyzes the actual memory location rather than the loaded SSA instance.
   MIRValue *getUnderlyingObject(MIRValue *val) {
     while (auto *inst = llvm::dyn_cast_or_null<MIRInst>(val)) {
-      if (auto *cast = llvm::dyn_cast_or_null<CastInst>(inst)) {
-        val = cast->getValue();
+      if (inst->getOpcode() == Opcode::BitCast ||
+          inst->getOpcode() == Opcode::AnyCast) {
+        val = static_cast<CastInst *>(inst)->getValue();
         continue;
       } else if (inst->getOpcode() == Opcode::ExtractValue) {
         auto *ext = static_cast<ExtractValueInst *>(inst);
@@ -163,6 +201,9 @@ private:
           continue;
         }
         break;
+      } else if (auto *load = llvm::dyn_cast_or_null<LoadInst>(inst)) {
+        val = load->getPointer();
+        continue;
       }
       break;
     }
@@ -228,65 +269,30 @@ private:
             if (arg == baseExitVal)
               isParam = true;
           }
-          if (!elidedFrontendRelease && !isParam) {
+
+          bool isFreshAlloc = false;
+          MIRValue *traceVal = exitVal;
+          while (traceVal) {
+            if (auto *cast = llvm::dyn_cast_or_null<CastInst>(traceVal)) {
+              traceVal = cast->getValue();
+            } else if (auto *load =
+                           llvm::dyn_cast_or_null<LoadInst>(traceVal)) {
+              traceVal = load->getPointer();
+            } else if (auto *alloca =
+                           llvm::dyn_cast_or_null<AllocaInst>(traceVal)) {
+              isFreshAlloc = true;
+              break;
+            } else {
+              break;
+            }
+          }
+
+          if (!elidedFrontendRelease && !isParam && !isFreshAlloc) {
             newInstructions.push_back(std::make_unique<ARCInst>(
                 Opcode::Retain, exitVal, nullptr, inst->getLoc()));
             blockModified = true;
           }
         }
-
-        if (auto *store = llvm::dyn_cast_or_null<StoreInst>(inst.get())) {
-          MIRValue *newValue = store->getValue();
-
-          if (newValue && newValue->getType() &&
-              isRefCounted(newValue->getType())) {
-            MIRValue *ptr = getUnderlyingObject(store->getPointer());
-            blockModified = true;
-
-            bool isFreshAllocation = false;
-            MIRValue *traceVal = newValue;
-
-            while (traceVal) {
-              if (auto *cast = llvm::dyn_cast_or_null<CastInst>(traceVal)) {
-                traceVal = cast->getValue();
-              } else {
-                break;
-              }
-            }
-
-            if (auto call = llvm::dyn_cast_or_null<CallInst>(traceVal)) {
-              if (call->getCallee() &&
-                  call->getCallee()->getName() == "__moksha_alloc") {
-                isFreshAllocation = true;
-              }
-            } else if (auto invoke = llvm::dyn_cast_or_null<InvokeInst>(traceVal)) {
-              if (invoke->getCallee() &&
-                  invoke->getCallee()->getName() == "__moksha_alloc") {
-                isFreshAllocation = true;
-              }
-            }
-
-            if (!isFreshAllocation) {
-              newInstructions.push_back(std::make_unique<ARCInst>(
-                  Opcode::Retain, newValue, nullptr, inst->getLoc()));
-            }
-
-            if (initializedPointers.count(ptr)) {
-              auto loadOld =
-                  std::make_unique<LoadInst>(ptr, "old_val", inst->getLoc());
-              MIRValue *oldValPtr = loadOld.get();
-              newInstructions.push_back(std::move(loadOld));
-              newInstructions.push_back(std::make_unique<ARCInst>(
-                  Opcode::Release, oldValPtr, getDropFunc(oldValPtr),
-                  inst->getLoc()));
-            }
-
-            initializedPointers.insert(ptr);
-            newInstructions.push_back(std::move(inst));
-            continue;
-          }
-        }
-
         newInstructions.push_back(std::move(inst));
       }
 

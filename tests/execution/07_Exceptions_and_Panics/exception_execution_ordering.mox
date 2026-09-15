@@ -14,6 +14,7 @@ int test_stacked_defers() {
 }
 
 // 2. DEFER INSIDE FINALLY
+// Note: An exception that escapes main() without being caught will intentionally crash the program.
 void test_defer_in_finally() {
     int x = 0;
     try {

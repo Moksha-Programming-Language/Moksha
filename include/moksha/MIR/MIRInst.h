@@ -350,6 +350,8 @@ enum class Opcode {
   Trunc,
   PtrToInt,
   IntToPtr,
+  FPExt,
+  FPTrunc,
   AnyCast,
   ArrayToSlice,
   SliceToArray,
@@ -804,7 +806,8 @@ public:
     return op == Opcode::BitCast || op == Opcode::IntToFloat ||
            op == Opcode::FloatToInt || op == Opcode::Trunc ||
            op == Opcode::SExt || op == Opcode::ZExt || op == Opcode::PtrToInt ||
-           op == Opcode::IntToPtr || op == Opcode::AnyCast ||
+           op == Opcode::IntToPtr || op == Opcode::FPExt ||
+           op == Opcode::FPTrunc || op == Opcode::AnyCast ||
            op == Opcode::ArrayToSlice || op == Opcode::SliceToArray ||
            op == Opcode::Upcast;
   }
@@ -945,6 +948,8 @@ public:
   MIRValue *getCallee() const { return callee; }
   const std::vector<MIRValue *> &getArgs() const { return args; }
   bool isVariadic() const { return isVarArg; }
+  bool returnsOwned() const { return returnsOwnedHeapVal; }
+  void setReturnsOwned(bool owned) { returnsOwnedHeapVal = owned; }
   void dump(llvm::raw_ostream &os) const override;
   void replaceOperand(MIRValue *oldVal, MIRValue *newVal) override {
     if (callee == oldVal)
@@ -957,14 +962,17 @@ public:
 
   std::unique_ptr<MIRInst> clone() const override {
     std::vector<MIRValue *> argsCopy = args;
-    return std::make_unique<CallInst>(callee, std::move(argsCopy), getType(),
-                                      getName(), isVarArg, loc);
+    auto cloned = std::make_unique<CallInst>(
+        callee, std::move(argsCopy), getType(), getName(), isVarArg, loc);
+    cloned->setReturnsOwned(returnsOwnedHeapVal);
+    return cloned;
   }
 
 private:
   MIRValue *callee;
   std::vector<MIRValue *> args;
   bool isVarArg;
+  bool returnsOwnedHeapVal = false;
 };
 
 // Exceptions & Stack Unwinding
@@ -980,14 +988,19 @@ public:
   const std::vector<MIRValue *> &getArgs() const { return args; }
   MIRBlock *getNormalDest() const { return normalDest; }
   MIRBlock *getUnwindDest() const { return unwindDest; }
+  bool returnsOwned() const { return returnsOwnedHeapVal; }
+  void setReturnsOwned(bool owned) { returnsOwnedHeapVal = owned; }
   void dump(llvm::raw_ostream &os) const override;
   void replaceOperand(MIRValue *oldVal, MIRValue *newVal) override;
   void setNormalDest(MIRBlock *b) { normalDest = b; }
   void setUnwindDest(MIRBlock *b) { unwindDest = b; }
   std::unique_ptr<MIRInst> clone() const override {
     std::vector<MIRValue *> argsCopy = args;
-    return std::make_unique<InvokeInst>(callee, std::move(argsCopy), normalDest,
-                                        unwindDest, getType(), getName(), loc);
+    auto cloned =
+        std::make_unique<InvokeInst>(callee, std::move(argsCopy), normalDest,
+                                     unwindDest, getType(), getName(), loc);
+    cloned->setReturnsOwned(returnsOwnedHeapVal);
+    return cloned;
   }
 
 private:
@@ -995,6 +1008,7 @@ private:
   std::vector<MIRValue *> args;
   MIRBlock *normalDest;
   MIRBlock *unwindDest;
+  bool returnsOwnedHeapVal = false;
 };
 
 class LandingPadInst : public MIRInst {

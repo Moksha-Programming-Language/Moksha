@@ -256,6 +256,20 @@ def Moksha_CastOp : Moksha_Op<"cast", [Pure]> {
     let assemblyFormat = "$value attr-dict `:` type($value) `to` type($res)";
 }
 
+def Moksha_FPExtOp : Moksha_Op<"fpext", [Pure]> {
+    let summary = "Floating point extension operation.";
+    let arguments = (ins AnyType:$operand);
+    let results = (outs AnyType:$res);
+    let assemblyFormat = "$operand attr-dict `:` type($operand) `to` type($res)";
+}
+
+def Moksha_FPTruncOp : Moksha_Op<"fptrunc", [Pure]> {
+    let summary = "Floating point truncation operation.";
+    let arguments = (ins AnyType:$operand);
+    let results = (outs AnyType:$res);
+    let assemblyFormat = "$operand attr-dict `:` type($operand) `to` type($res)";
+}
+
 def Moksha_BitcastOp : Moksha_Op<"bitcast", [Pure]> {
     let summary = "Bitwise reinterpretation of a value without numeric conversion.";
     let arguments = (ins AnyType:$operand);
