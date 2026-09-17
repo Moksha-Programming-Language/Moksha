@@ -268,31 +268,24 @@ public:
     const hir::HIRType *checkTy = stripMemoryModifiers(finalTy);
 
     bool typeIsARC = false;
-    while (checkTy) {
-      if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
-        if (ptrTy->getOwnership() == hir::Ownership::Shared ||
-            ptrTy->getOwnership() == hir::Ownership::Owned ||
-            ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
-          typeIsARC = true;
-        }
-        checkTy = stripMemoryModifiers(ptrTy->getPointee());
-      } else if (auto *refTy =
-                     llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
-        if (refTy->getOwnership() == hir::Ownership::Shared ||
-            refTy->getOwnership() == hir::Ownership::Owned ||
-            refTy->getInner()->getKind() == hir::TypeKind::Any) {
-          typeIsARC = true;
-        }
-        checkTy = stripMemoryModifiers(refTy->getInner());
-      } else if (auto *nullTy =
-                     llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
-        checkTy = stripMemoryModifiers(nullTy->getInner());
-      } else {
-        break;
-      }
+    if (auto *nullTy = llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+      checkTy = stripMemoryModifiers(nullTy->getInner());
     }
 
-    if (checkTy) {
+    if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+      if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+          ptrTy->getOwnership() == hir::Ownership::Owned ||
+          ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+        typeIsARC = true;
+      }
+    } else if (auto *refTy =
+                   llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+      if (refTy->getOwnership() == hir::Ownership::Shared ||
+          refTy->getOwnership() == hir::Ownership::Owned ||
+          refTy->getInner()->getKind() == hir::TypeKind::Any) {
+        typeIsARC = true;
+      }
+    } else if (checkTy) {
       auto kind = checkTy->getKind();
       if (kind == hir::TypeKind::String || kind == hir::TypeKind::Slice ||
           kind == hir::TypeKind::Map || kind == hir::TypeKind::Closure ||
@@ -307,10 +300,6 @@ public:
       }
       if (!typeIsARC) {
         std::string className = checkTy->toString();
-        while (!className.empty() &&
-               (className[0] == '*' || className[0] == '&' ||
-                className[0] == ' ' || className[0] == '?'))
-          className = className.substr(1);
         if (className.find("struct.") == 0)
           className = className.substr(7);
         if (className.find("class.") == 0)
@@ -7851,33 +7840,25 @@ private:
           bool isARC = false;
           const hir::HIRType *checkTy = stripMemoryModifiers(expectedTy);
 
-          while (checkTy) {
-            if (auto *ptrTy =
-                    llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
-              if (ptrTy->getOwnership() == hir::Ownership::Shared ||
-                  ptrTy->getOwnership() == hir::Ownership::Owned ||
-                  ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
-                isARC = true;
-              }
-              checkTy = stripMemoryModifiers(ptrTy->getPointee());
-            } else if (auto *refTy = llvm::dyn_cast_or_null<hir::ReferenceType>(
-                           checkTy)) {
-              if (refTy->getOwnership() == hir::Ownership::Shared ||
-                  refTy->getOwnership() == hir::Ownership::Owned ||
-                  refTy->getInner()->getKind() == hir::TypeKind::Any) {
-                isARC = true;
-              }
-              checkTy = stripMemoryModifiers(refTy->getInner());
-            } else if (auto *nullTy =
-                           llvm::dyn_cast_or_null<hir::HIRNullableType>(
-                               checkTy)) {
-              checkTy = stripMemoryModifiers(nullTy->getInner());
-            } else {
-              break;
-            }
+          if (auto *nullTy =
+                  llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+            checkTy = stripMemoryModifiers(nullTy->getInner());
           }
 
-          if (checkTy) {
+          if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+            if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+                ptrTy->getOwnership() == hir::Ownership::Owned ||
+                ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+              isARC = true;
+            }
+          } else if (auto *refTy =
+                         llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+            if (refTy->getOwnership() == hir::Ownership::Shared ||
+                refTy->getOwnership() == hir::Ownership::Owned ||
+                refTy->getInner()->getKind() == hir::TypeKind::Any) {
+              isARC = true;
+            }
+          } else if (checkTy) {
             auto k = checkTy->getKind();
             if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
                 k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
@@ -7894,9 +7875,6 @@ private:
             }
             if (!isARC) {
               std::string cName = checkTy->toString();
-              while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
-                                        cName[0] == ' ' || cName[0] == '?'))
-                cName = cName.substr(1);
               if (cName.find("struct.") == 0)
                 cName = cName.substr(7);
               if (cName.find("class.") == 0)
@@ -12607,31 +12585,26 @@ private:
                               const hir::HIRType *eTy) {
       bool typeIsARC = false;
       const hir::HIRType *checkTy = stripMemoryModifiers(eTy);
-      while (checkTy) {
-        if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
-          if (ptrTy->getOwnership() == hir::Ownership::Shared ||
-              ptrTy->getOwnership() == hir::Ownership::Owned ||
-              ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
-            typeIsARC = true;
-          }
-          checkTy = stripMemoryModifiers(ptrTy->getPointee());
-        } else if (auto *refTy =
-                       llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
-          if (refTy->getOwnership() == hir::Ownership::Shared ||
-              refTy->getOwnership() == hir::Ownership::Owned ||
-              refTy->getInner()->getKind() == hir::TypeKind::Any) {
-            typeIsARC = true;
-          }
-          checkTy = stripMemoryModifiers(refTy->getInner());
-        } else if (auto *nullTy =
-                       llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
-          checkTy = stripMemoryModifiers(nullTy->getInner());
-        } else {
-          break;
-        }
+
+      if (auto *nullTy =
+              llvm::dyn_cast_or_null<hir::HIRNullableType>(checkTy)) {
+        checkTy = stripMemoryModifiers(nullTy->getInner());
       }
 
-      if (checkTy) {
+      if (auto *ptrTy = llvm::dyn_cast_or_null<hir::PointerType>(checkTy)) {
+        if (ptrTy->getOwnership() == hir::Ownership::Shared ||
+            ptrTy->getOwnership() == hir::Ownership::Owned ||
+            ptrTy->getPointee()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+      } else if (auto *refTy =
+                     llvm::dyn_cast_or_null<hir::ReferenceType>(checkTy)) {
+        if (refTy->getOwnership() == hir::Ownership::Shared ||
+            refTy->getOwnership() == hir::Ownership::Owned ||
+            refTy->getInner()->getKind() == hir::TypeKind::Any) {
+          typeIsARC = true;
+        }
+      } else if (checkTy) {
         auto k = checkTy->getKind();
         if (k == hir::TypeKind::String || k == hir::TypeKind::Slice ||
             k == hir::TypeKind::Array || k == hir::TypeKind::Map ||
@@ -12647,9 +12620,6 @@ private:
         }
         if (!typeIsARC) {
           std::string cName = checkTy->toString();
-          while (!cName.empty() && (cName[0] == '*' || cName[0] == '&' ||
-                                    cName[0] == ' ' || cName[0] == '?'))
-            cName = cName.substr(1);
           if (cName.find("struct.") == 0)
             cName = cName.substr(7);
           if (cName.find("class.") == 0)

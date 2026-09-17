@@ -151,6 +151,45 @@ static int internal_ftoa(double val, char *buf) {
   return j;
 }
 
+// Manually decode a 16-bit float to a 32-bit float to bypass MinGW ABI bugs
+static float half_to_float(uint16_t h) {
+  uint32_t sign = (h >> 15) & 1;
+  uint32_t exp = (h >> 10) & 0x1F;
+  uint32_t mant = h & 0x3FF;
+
+  uint32_t f_exp, f_mant;
+
+  if (exp == 0) {
+    if (mant == 0) {
+      f_exp = 0;
+      f_mant = 0;
+    } else {
+      // Subnormal handling
+      while ((mant & 0x400) == 0) {
+        mant <<= 1;
+        exp--;
+      }
+      exp++;
+      mant &= ~0x400;
+      f_exp = (exp + 127 - 15) << 23;
+      f_mant = mant << 13;
+    }
+  } else if (exp == 0x1F) {
+    // Infinity or NaN
+    f_exp = 255 << 23;
+    f_mant = mant << 13;
+  } else {
+    // Normal number
+    f_exp = (exp + 127 - 15) << 23;
+    f_mant = mant << 13;
+  }
+
+  uint32_t f_bits = (sign << 31) | f_exp | f_mant;
+  float f;
+  __builtin_memcpy(&f, &f_bits, 4);
+  return f;
+}
+
 static int stdout_lock = 0;
 static inline void acquire_print_lock(void) {
   while (__atomic_exchange_n(&stdout_lock, 1, __ATOMIC_ACQUIRE)) {
@@ -408,9 +447,12 @@ char *__moksha_usize_to_string(void *ptr) {
 char *__moksha_quarter_to_string(void *ptr) {
   if (!ptr)
     return __moksha_cstr_to_string("null");
-  float val = *(float *)ptr;
+
+  uint16_t raw_bits = *(uint16_t *)ptr;
+  float val = half_to_float(raw_bits);
+
   char buf[64];
-  int len = internal_ftoa(val, buf);
+  int len = internal_ftoa((double)val, buf);
   char *str = (char *)moksha_rt_alloc(len + 1, MOKSHA_TYPE_STRING);
   __builtin_memcpy(str, buf, len + 1);
   return str;
@@ -419,9 +461,12 @@ char *__moksha_quarter_to_string(void *ptr) {
 char *__moksha_half_to_string(void *ptr) {
   if (!ptr)
     return __moksha_cstr_to_string("null");
-  float val = *(float *)ptr;
+
+  uint16_t raw_bits = *(uint16_t *)ptr;
+  float val = half_to_float(raw_bits);
+
   char buf[64];
-  int len = internal_ftoa(val, buf);
+  int len = internal_ftoa((double)val, buf);
   char *str = (char *)moksha_rt_alloc(len + 1, MOKSHA_TYPE_STRING);
   __builtin_memcpy(str, buf, len + 1);
   return str;
