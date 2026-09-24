@@ -94,6 +94,7 @@ else()
     -Wall
     -Wextra
     -Wpedantic
+    -Wno-unused-parameter
     -Wno-deprecated-declarations
   )
 endif()

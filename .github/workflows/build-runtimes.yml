@@ -34,12 +34,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build clang gcc-multilib
 
+      # ----------------------------------------------------
+      # Setup WASI SDK for ALL WebAssembly Targets
+      # ----------------------------------------------------
       - name: Setup WASI SDK
-        if: matrix.target == 'wasi'
+        if: matrix.target == 'wasi' || matrix.target == 'wasm_web'
         run: |
           wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-20/wasi-sdk-20.0-linux.tar.gz
           tar xvf wasi-sdk-20.0-linux.tar.gz
-          echo "WASI_SDK_PATH=$(pwd)/wasi-sdk-20.0" >> $GITHUB_ENV
+          # The toolchain file specifically requires WASI_SDK_PREFIX
+          echo "WASI_SDK_PREFIX=$(pwd)/wasi-sdk-20.0" >> $GITHUB_ENV
 
       - name: Setup Android NDK
         if: matrix.target == 'android-arm64'
@@ -50,13 +54,26 @@ jobs:
       - name: Configure and Build Runtime
         run: |
           if [ "${{ matrix.target }}" == "wasi" ]; then
-            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_TOOLCHAIN_FILE=${WASI_SDK_PATH}/share/cmake/wasi-sdk.cmake
+            # Let the WASI toolchain handle the compiler paths natively
+            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} \
+              -DCMAKE_TOOLCHAIN_FILE=$WASI_SDK_PREFIX/share/cmake/wasi-sdk.cmake \
+              -DWASI_SDK_PREFIX=$WASI_SDK_PREFIX
           elif [ "${{ matrix.target }}" == "wasm_web" ]; then
-            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_C_COMPILER=clang -DCMAKE_C_FLAGS="--target=wasm32-unknown-unknown -nostdlib" -DCMAKE_SYSTEM_NAME=Generic -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+            # Force the use of the WASI Clang compiler and its sysroot for headers
+            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} \
+              -DCMAKE_C_COMPILER=$WASI_SDK_PREFIX/bin/clang \
+              -DCMAKE_C_FLAGS="--target=wasm32-unknown-unknown --sysroot=$WASI_SDK_PREFIX/share/wasi-sysroot -nostdlib" \
+              -DCMAKE_SYSTEM_NAME=Generic \
+              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
           elif [ "${{ matrix.target }}" == "android-arm64" ]; then
-            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a
+            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} \
+              -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=arm64-v8a
           else
-            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_C_COMPILER=clang -DCMAKE_SYSTEM_NAME=Generic -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} \
+              -DCMAKE_C_COMPILER=clang \
+              -DCMAKE_SYSTEM_NAME=Generic \
+              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
           fi
           cmake --build build-rt
 
