@@ -81,6 +81,7 @@ jobs:
           elif [ "$RUNNER_OS" = "macOS" ]; then
             export CC=$(brew --prefix llvm@22)/bin/clang
             export CXX=$(brew --prefix llvm@22)/bin/clang++
+            export AR=$(brew --prefix llvm@22)/bin/llvm-ar
             export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
             export CFLAGS="-isysroot $SDKROOT"
             export CXXFLAGS="-isysroot $SDKROOT"
