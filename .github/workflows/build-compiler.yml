@@ -31,6 +31,7 @@ jobs:
           install: >-
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-llvm
+            mingw-w64-ucrt-x86_64-clang
             mingw-w64-ucrt-x86_64-mlir
             mingw-w64-ucrt-x86_64-lld
             mingw-w64-ucrt-x86_64-cmake
@@ -80,6 +81,9 @@ jobs:
           elif [ "$RUNNER_OS" = "macOS" ]; then
             export CC=$(brew --prefix llvm@22)/bin/clang
             export CXX=$(brew --prefix llvm@22)/bin/clang++
+            export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+            export CFLAGS="-isysroot $SDKROOT"
+            export CXXFLAGS="-isysroot $SDKROOT"
           fi
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
