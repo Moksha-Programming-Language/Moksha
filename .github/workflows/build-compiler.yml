@@ -85,6 +85,7 @@ jobs:
             export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
             export CFLAGS="-isysroot $SDKROOT"
             export CXXFLAGS="-isysroot $SDKROOT"
+            export LDFLAGS="-L$(brew --prefix lld)/lib"
             CMAKE_ARGS="-DCMAKE_AR=$(brew --prefix llvm@22)/bin/llvm-ar -DCMAKE_RANLIB=$(brew --prefix llvm@22)/bin/llvm-ranlib"
           fi
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $CMAKE_ARGS
