@@ -1,0 +1,84 @@
+name: Build Moksha Compiler
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  host-compiler:
+    name: Compiler on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------
+      # 1. WINDOWS (MSYS2) TOOLCHAIN
+      # ----------------------------------------------------
+      - name: Set Up MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-llvm
+            mingw-w64-x86_64-mlir
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      # ----------------------------------------------------
+      # 2. LINUX (APT) TOOLCHAIN
+      # ----------------------------------------------------
+      - name: Set Up LLVM/MLIR (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y libmlir-22-dev mlir-22-tools ninja-build
+          echo "LLVM_DIR=/usr/lib/llvm-22/cmake" >> $GITHUB_ENV
+          echo "MLIR_DIR=/usr/lib/llvm-22/cmake" >> $GITHUB_ENV
+
+      # ----------------------------------------------------
+      # 3. MACOS (HOMEBREW) TOOLCHAIN
+      # ----------------------------------------------------
+      - name: Set Up LLVM/MLIR (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@22 ninja
+          echo "LLVM_DIR=$(brew --prefix llvm@22)/lib/cmake/llvm" >> $GITHUB_ENV
+          echo "MLIR_DIR=$(brew --prefix llvm@22)/lib/cmake/mlir" >> $GITHUB_ENV
+
+      # ----------------------------------------------------
+      # BUILD PHASES
+      # ----------------------------------------------------
+      - name: Configure and Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Configure and Build (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Upload Compiler Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mokshac-${{ runner.os }}
+          path: |
+            build/tools/mokshac*
+            build/tools/moksha-opt*
+            build/runtime/*.a

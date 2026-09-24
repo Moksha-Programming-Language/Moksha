@@ -1,0 +1,47 @@
+name: "CodeQL Security Analysis"
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  schedule:
+    - cron: "30 1 * * 0"
+
+jobs:
+  analyze:
+    name: Analyze Codebase
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux Build Dependencies
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y libmlir-22-dev mlir-22-tools ninja-build
+          echo "LLVM_DIR=/usr/lib/llvm-22/cmake" >> $GITHUB_ENV
+          echo "MLIR_DIR=/usr/lib/llvm-22/cmake" >> $GITHUB_ENV
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - name: Build Moksha (CodeQL Tracing Phase)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
