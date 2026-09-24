@@ -52,12 +52,12 @@ jobs:
           if [ "${{ matrix.target }}" == "wasi" ]; then
             cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_TOOLCHAIN_FILE=${WASI_SDK_PATH}/share/cmake/wasi-sdk.cmake
           elif [ "${{ matrix.target }}" == "wasm_web" ]; then
-            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_C_COMPILER=clang -DCMAKE_C_FLAGS="--target=wasm32-unknown-unknown -nostdlib"
+            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_C_COMPILER=clang -DCMAKE_C_FLAGS="--target=wasm32-unknown-unknown -nostdlib" -DCMAKE_SYSTEM_NAME=Generic -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
           elif [ "${{ matrix.target }}" == "android-arm64" ]; then
             cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a
           else
-            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_C_COMPILER=clang
-          endif
+            cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} -DCMAKE_C_COMPILER=clang -DCMAKE_SYSTEM_NAME=Generic -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+          fi
           cmake --build build-rt
 
       - name: Upload Runtime Archive
