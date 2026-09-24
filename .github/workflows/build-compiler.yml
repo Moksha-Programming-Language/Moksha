@@ -75,18 +75,19 @@ jobs:
       - name: Configure and Build (Unix)
         if: runner.os != 'Windows'
         run: |
+          CMAKE_ARGS=""
           if [ "$RUNNER_OS" = "Linux" ]; then
             export CC=clang-22
             export CXX=clang++-22
           elif [ "$RUNNER_OS" = "macOS" ]; then
             export CC=$(brew --prefix llvm@22)/bin/clang
             export CXX=$(brew --prefix llvm@22)/bin/clang++
-            export AR=$(brew --prefix llvm@22)/bin/llvm-ar
             export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
             export CFLAGS="-isysroot $SDKROOT"
             export CXXFLAGS="-isysroot $SDKROOT"
+            CMAKE_ARGS="-DCMAKE_AR=$(brew --prefix llvm@22)/bin/llvm-ar -DCMAKE_RANLIB=$(brew --prefix llvm@22)/bin/llvm-ranlib"
           fi
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $CMAKE_ARGS
           cmake --build build
 
       - name: Upload Compiler Artifacts
