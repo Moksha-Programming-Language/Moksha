@@ -56,7 +56,7 @@ jobs:
       - name: Set Up LLVM/MLIR (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm@22 ninja
+          brew install llvm@22 ninja lld
           echo "LLVM_DIR=$(brew --prefix llvm@22)/lib/cmake/llvm" >> $GITHUB_ENV
           echo "MLIR_DIR=$(brew --prefix llvm@22)/lib/cmake/mlir" >> $GITHUB_ENV
 
