@@ -5,6 +5,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/* MacOS Compatibility fallback for timer events */
+#ifndef NOTE_MSECONDS
+#define NOTE_MSECONDS 0x00000000
+#endif
+
 static int kq_fd = -1;
 static uint64_t timer_id_counter = 1;
 

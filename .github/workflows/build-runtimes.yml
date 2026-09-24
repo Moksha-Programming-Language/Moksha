@@ -59,10 +59,10 @@ jobs:
               -DCMAKE_TOOLCHAIN_FILE=$WASI_SDK_PREFIX/share/cmake/wasi-sdk.cmake \
               -DWASI_SDK_PREFIX=$WASI_SDK_PREFIX
           elif [ "${{ matrix.target }}" == "wasm_web" ]; then
-            # Force the use of the WASI Clang compiler and its sysroot for headers
+            # Force the use of the WASI sysroot, and define __wasi__ to pass header guards
             cmake -B build-rt -S runtime -G Ninja ${{ matrix.flags }} \
               -DCMAKE_C_COMPILER=$WASI_SDK_PREFIX/bin/clang \
-              -DCMAKE_C_FLAGS="--target=wasm32-unknown-unknown --sysroot=$WASI_SDK_PREFIX/share/wasi-sysroot -nostdlib" \
+              -DCMAKE_C_FLAGS="--target=wasm32-unknown-unknown --sysroot=$WASI_SDK_PREFIX/share/wasi-sysroot -nostdlib -D__wasi__" \
               -DCMAKE_SYSTEM_NAME=Generic \
               -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
           elif [ "${{ matrix.target }}" == "android-arm64" ]; then
@@ -76,9 +76,3 @@ jobs:
               -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
           fi
           cmake --build build-rt
-
-      - name: Upload Runtime Archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: libmoksha_rt_${{ matrix.target }}
-          path: build-rt/*.a
